@@ -1,9 +1,9 @@
 use clap::Parser;
-use codeactor_codebase::cli::{Cli, CodeBaseRunner};
-use codeactor_codebase::cli::args::Commands;
-use codeactor_codebase::http::CodeBaseServer;
-use codeactor_codebase::storage::StorageManager;
-use codeactor_codebase::config::Config;
+use codeseek::cli::{Cli, CodeSeekRunner};
+use codeseek::cli::args::Commands;
+use codeseek::http::CodeSeekServer;
+use codeseek::storage::StorageManager;
+use codeseek::config::Config;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Server { address, storage_mode, repo_path } => {
             let default_addr = format!("127.0.0.1:{}", 12700);
             let server_addr = address.as_deref().unwrap_or(&default_addr);
-            info!("Starting CodeBase HTTP server on {}, repo: {}", server_addr, repo_path);
+            info!("Starting CodeSeek HTTP server on {}, repo: {}", server_addr, repo_path);
 
             // Determine storage mode
             let storage_mode = storage_mode.as_ref().unwrap_or(&cli.storage_mode).clone();
@@ -50,11 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(StorageManager::with_storage_mode(storage_mode))
             };
 
-            let mut server = CodeBaseServer::new(storage, repo_path.clone());
+            let mut server = CodeSeekServer::new(storage, repo_path.clone());
             server.start(server_addr).await?;
         }
         Commands::Vectorize { .. } => {
-            CodeBaseRunner::run(cli, config).await?;
+            CodeSeekRunner::run(cli, config).await?;
         }
     }
 

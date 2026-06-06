@@ -31,7 +31,7 @@ cargo run -- vectorize --path /path/to/code --collection my-collection --db-uri 
 src/
 ├── main.rs              # CLI entry: server and vectorize subcommands
 ├── lib.rs               # Top-level module re-exports
-├── config.rs            # Config loading from ~/.codeactor/config/config.toml
+├── config.rs            # Config loading from ~/.codeseek/config/config.toml
 ├── cli/                 # CLI args (clap), runner, analyze, vectorize commands
 ├── codegraph/           # AST parsing + graph data structures
 │   ├── graph.rs         # Flat CodeGraph (HashMap-based)
@@ -48,7 +48,7 @@ src/
 │   ├── incremental.rs   # MD5-based incremental file change detection
 │   └── mod.rs           # StorageManager: central hub (graph, watchers, tasks, config, current_repo)
 ├── http/                # Axum HTTP server
-│   ├── server.rs        # CodeBaseServer: startup init + router
+│   ├── server.rs        # CodeSeekServer: startup init + router
 │   ├── handlers/        # Request handlers (query, search, investigate, embed)
 │   └── models/          # Request/response types + ApiResponse<T>
 └── config/              # Config file template
@@ -63,7 +63,7 @@ The process binds to exactly one repository at startup via `--repo-path`. `Stora
 - **`StorageManager`** — Central state: in-memory graph, persistence, file watchers, embedding tasks, config, current repo binding
 - **`PetCodeGraph`** — petgraph `DiGraph<FunctionInfo, CallRelation>` with query methods (`get_callers`, `get_callees`, `find_functions_by_name`, `find_functions_by_file`)
 - **`CodeAnalyzer`** — Wraps `CodeParser`, runs full directory analysis, provides analysis methods
-- **`CodeBaseServer`** — Axum server; `start()` auto-inits (load/analyze graph + embed + watch) before binding port
+- **`CodeSeekServer`** — Axum server; `start()` auto-inits (load/analyze graph + embed + watch) before binding port
 - **`EmbeddingService`** — LanceDB-backed; per-repo tables named `{last_dir}_{md5(repo_path)}`; batch embedding with SQLite cache; incremental via `projects.json` file hashes
 - **`PersistenceManager`** — File-based graph persistence in `.codegraph_db/{project_id}/`
 
@@ -86,7 +86,7 @@ All handlers use `State<Arc<StorageManager>>` for shared state. Response type is
 
 ## Configuration
 
-Config file at `~/.codeactor/config/config.toml`. Key sections:
+Config file at `~/.codeseek/config/config.toml`. Key sections:
 
 - `[http]` — `server_port`, `codebase_port` (default 12800)
 - `[codebase]` — `enable_embedding`, `embedding_db_uri`, `graph_db_uri`

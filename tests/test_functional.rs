@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use std::fs;
 
-use codeactor_codebase::storage::StorageManager;
-use codeactor_codebase::services::CodeAnalyzer;
-use codeactor_codebase::codegraph::types::PetCodeGraph;
+use codeseek::storage::StorageManager;
+use codeseek::services::CodeAnalyzer;
+use codeseek::codegraph::types::PetCodeGraph;
 use uuid::Uuid;
 
 /// 测试构建图功能

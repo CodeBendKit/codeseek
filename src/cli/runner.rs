@@ -1,15 +1,15 @@
 use tracing::info;
 use crate::config::Config;
-use crate::http::server::CodeBaseServer;
+use crate::http::server::CodeSeekServer;
 use crate::storage::StorageManager;
 use std::sync::Arc;
 
 use super::args::{Cli, Commands};
 use super::vectorize::run_vectorize;
 
-pub struct CodeBaseRunner;
+pub struct CodeSeekRunner;
 
-impl CodeBaseRunner {
+impl CodeSeekRunner {
     pub fn new() -> Self {
         Self
     }
@@ -26,7 +26,7 @@ impl CodeBaseRunner {
                 };
 
                 let addr = address.unwrap_or_else(|| "127.0.0.1:3000".to_string());
-                let mut server = CodeBaseServer::new(storage, repo_path);
+                let mut server = CodeSeekServer::new(storage, repo_path);
                 server.start(&addr).await?;
             }
             Commands::Vectorize { path, collection, db_uri } => {

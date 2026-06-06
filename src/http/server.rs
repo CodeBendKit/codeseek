@@ -40,7 +40,7 @@ pub struct AppState {
     pub hybrid: Option<Arc<HybridSearchService>>,
 }
 
-pub struct CodeBaseServer {
+pub struct CodeSeekServer {
     storage: Arc<StorageManager>,
     repo_path: String,
     /// Hybrid search service for semantic search endpoint.
@@ -58,7 +58,7 @@ struct StatusResponse {
     indexing_status: String,
 }
 
-impl CodeBaseServer {
+impl CodeSeekServer {
     pub fn new(storage: Arc<StorageManager>, repo_path: String) -> Self {
         Self {
             storage,
@@ -230,7 +230,7 @@ impl CodeBaseServer {
         let app = self.create_router();
 
         let listener = TcpListener::bind(addr).await?;
-        println!("CodeGraph HTTP server starting on {}, repo: {}", addr, repo_path);
+        println!("CodeSeek HTTP server starting on {}, repo: {}", addr, repo_path);
 
         axum::serve(listener, app).await?;
         Ok(())
@@ -430,7 +430,7 @@ impl CodeBaseServer {
 async fn health_check() -> Json<ApiResponse<&'static str>> {
     Json(ApiResponse {
         success: true,
-        data: "Codebase HTTP service is running",
+        data: "CodeSeek HTTP service is running",
     })
 }
 

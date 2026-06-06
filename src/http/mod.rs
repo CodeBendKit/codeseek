@@ -3,4 +3,4 @@ pub mod handlers;
 pub mod models;
 pub mod middleware;
 
-pub use server::CodeBaseServer; 
+pub use server::CodeSeekServer; 

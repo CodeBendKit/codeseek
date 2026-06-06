@@ -1,8 +1,8 @@
-# CodeActor Codebase 架构与功能说明
+# CodeSeek 架构与功能说明
 
 ## 概述
 
-CodeActor Codebase 是一个 Rust 实现的多语言代码分析引擎，提供源码 AST 解析、函数调用图谱构建、代码向量嵌入索引和语义搜索能力。系统以 HTTP 服务形式运行，启动时绑定单个仓库，支持 6 种主流编程语言。
+CodeSeek 是一个 Rust 实现的多语言代码分析引擎，提供源码 AST 解析、函数调用图谱构建、代码向量嵌入索引和语义搜索能力。系统以 HTTP 服务形式运行，启动时绑定单个仓库，支持 6 种主流编程语言。
 
 ## 核心设计原则
 
@@ -20,7 +20,7 @@ cargo run -- server --repo-path /path/to/repo
 
 ### 启动自初始化
 
-`CodeBaseServer::start()` 方法在绑定端口前执行完整的初始化流程：
+`CodeSeekServer::start()` 方法在绑定端口前执行完整的初始化流程：
 
 1. 验证 `--repo-path` 路径是否存在
 2. 绑定进程到该仓库 (`try_bind_repo`)
@@ -41,7 +41,7 @@ cargo run -- server --repo-path /path/to/repo
                              │              │
               ┌──────────────▼──┐   ┌──────▼──────────────┐
               │  http/server.rs  │   │    cli/runner.rs     │
-              │  CodeBaseServer  │   │  vectorize 命令行模式 │
+              │  CodeSeekServer  │   │  vectorize 命令行模式 │
               └──────┬───────────┘   └─────────────────────┘
                      │
          ┌───────────┼───────────┐
@@ -84,7 +84,7 @@ cargo run -- server --repo-path /path/to/repo
 | 层 | 模块 | 职责 |
 |---|------|------|
 | 入口 | `main.rs` | CLI 参数解析 (`clap`)，分发到 server 或 vectorize 子命令 |
-| 配置 | `config.rs` | 从 `~/.codeactor/config/config.toml` 加载全局配置 |
+| 配置 | `config.rs` | 从 `~/.codeseek/config/config.toml` 加载全局配置 |
 | HTTP | `http/` | Axum 路由、请求处理、响应模型、ECharts HTML 模板 |
 | 状态 | `storage/` | `StorageManager` 集中管理：图谱缓存、持久化、文件监听、嵌入任务 |
 | 服务 | `services/` | 高层分析逻辑：代码分析器、代码片段服务、嵌入服务 |
@@ -333,7 +333,7 @@ TreeSitterParser::parse_file(path)
 
 ### 启动时
 
-`CodeBaseServer::start()` 流程中调用 `trigger_embedding_build()`：
+`CodeSeekServer::start()` 流程中调用 `trigger_embedding_build()`：
 
 1. 检查配置中 `enable_embedding` 是否为 true
 2. 检查 `vector_tasks` 集合防止重复任务
@@ -365,7 +365,7 @@ SQLite embedding_cache 表:
 ## 配置系统
 
 ```toml
-# ~/.codeactor/config/config.toml
+# ~/.codeseek/config/config.toml
 
 [http]
 server_port = 12800           # 默认 HTTP 端口

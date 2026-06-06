@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="CodeActor Logo" width="120"/>
+  <img src="assets/logo.png" alt="CodeSeek Logo" width="120"/>
 </p>
 
-<h1 align="center">CodeActor Codebase</h1>
+<h1 align="center">CodeSeek</h1>
 
 <p align="center">
   <b>融合代码图与语义向量的双引擎代码智能检索系统</b> <br>
@@ -21,7 +21,7 @@
 
 ## 🔥 项目简介
 
-**CodeActor Codebase** 是一个用 **Rust** 构建的双引擎代码智能检索系统。它不仅像一张「代码的 CT 扫描图」——深入解析 AST 构建函数调用图谱，还同时为代码建立**语义向量索引**，让你可以用自然语言搜索代码，并通过**混合检索流水线**将图遍历、向量搜索、BM25 关键词匹配融合为精准结果。
+**CodeSeek** 是一个用 **Rust** 构建的双引擎代码智能检索系统。它不仅像一张「代码的 CT 扫描图」——深入解析 AST 构建函数调用图谱，还同时为代码建立**语义向量索引**，让你可以用自然语言搜索代码，并通过**混合检索流水线**将图遍历、向量搜索、BM25 关键词匹配融合为精准结果。
 
 > 🎯 **核心价值**：将混乱的代码仓库变为可导航、可搜索、可理解的知识图谱
 
@@ -123,7 +123,7 @@ sequenceDiagram
 
 ```bash
 git clone <your-repo-url>
-cd codeactor-agent/codebase
+cd codeseek
 cargo build --release
 ```
 
@@ -165,7 +165,7 @@ graph TD
 | 层级 | 模块 | 职责 |
 |:---|:---|:---|
 | 🚪 入口 | `main.rs` | CLI 参数解析 (`clap`)，分发到 server/vectorize |
-| ⚙️ 配置 | `config.rs` | 从 `~/.codeactor/config/config.toml` 加载配置 |
+| ⚙️ 配置 | `config.rs` | 从 `~/.codeseek/config/config.toml` 加载配置 |
 | 🌐 HTTP | `http/` | Axum 路由、请求处理、响应模型、ECharts 模板 |
 | 📦 状态 | `storage/` | `StorageManager` 中心管理：图谱、持久化、监听、任务 |
 | 🧠 服务 | `services/` | 高级分析：CodeAnalyzer、EmbeddingService、HybridSearch |
@@ -219,7 +219,7 @@ curl -X POST http://localhost:12800/query_call_graph \
 
 ## ⚙️ 配置
 
-配置文件位于 `~/.codeactor/config/config.toml`：
+配置文件位于 `~/.codeseek/config/config.toml`：
 
 ```toml
 [http]
@@ -288,7 +288,7 @@ src/
 │   ├── incremental.rs   # MD5 增量变更检测
 │   └── tantivy_index.rs       # BM25 全文搜索索引
 └── http/                # HTTP 服务层
-    ├── server.rs        # CodeBaseServer：启动 + 路由
+    ├── server.rs        # CodeSeekServer：启动 + 路由
     ├── handlers/        # 请求处理（query / search / investigate / embed）
     └── models/          # 请求/响应数据结构
 ```
@@ -336,7 +336,7 @@ src/
 
 ## 📄 License
 
-**MIT** © CodeActor
+**MIT** © CodeSeek
 
 使用到的优秀开源项目：Tree-sitter · Petgraph · LanceDB · Tantivy · Axum · Tokio · Clap
 

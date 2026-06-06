@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="CodeActor Logo" width="120"/>
+  <img src="assets/logo.png" alt="CodeSeek Logo" width="120"/>
 </p>
 
-<h1 align="center">CodeActor Codebase</h1>
+<h1 align="center">CodeSeek</h1>
 
 <p align="center">
   <b>A Dual-Engine Code Intelligence & Retrieval System</b> <br>
@@ -21,7 +21,7 @@
 
 ## 🔥 Overview
 
-**CodeActor Codebase** is a high-performance code intelligence and retrieval system built with **Rust**. Think of it as a **CT scan for your codebase** — it doesn't just parse your source code; it builds a complete **function call graph** AND a **semantic vector index**, then fuses them together through a sophisticated hybrid retrieval pipeline.
+**CodeSeek** is a high-performance code intelligence and retrieval system built with **Rust**. Think of it as a **CT scan for your codebase** — it doesn't just parse your source code; it builds a complete **function call graph** AND a **semantic vector index**, then fuses them together through a sophisticated hybrid retrieval pipeline.
 
 > 🎯 **Core Value**: Transform your chaotic codebase into a navigable, searchable, and machine-understandable knowledge graph.
 
@@ -123,7 +123,7 @@ sequenceDiagram
 
 ```bash
 git clone <your-repo-url>
-cd codeactor-agent/codebase
+cd codeseek
 cargo build --release
 ```
 
@@ -165,7 +165,7 @@ graph TD
 | Layer | Module | Responsibility |
 |:---|:---|:---|
 | 🚪 Entry | `main.rs` | CLI arg parsing (`clap`), dispatch to server/vectorize |
-| ⚙️ Config | `config.rs` | Load config from `~/.codeactor/config/config.toml` |
+| ⚙️ Config | `config.rs` | Load config from `~/.codeseek/config/config.toml` |
 | 🌐 HTTP | `http/` | Axum routes, request handling, response models, ECharts templates |
 | 📦 State | `storage/` | `StorageManager` — central hub for graph, persistence, watchers, tasks |
 | 🧠 Services | `services/` | High-level analysis: CodeAnalyzer, EmbeddingService, HybridSearch |
@@ -235,7 +235,7 @@ Open `http://localhost:12800/` or `http://localhost:12800/draw_call_graph?filepa
 
 ## ⚙️ Configuration
 
-Configuration file at `~/.codeactor/config/config.toml`:
+Configuration file at `~/.codeseek/config/config.toml`:
 
 ```toml
 [http]
@@ -304,7 +304,7 @@ src/
 │   ├── incremental.rs   # MD5 incremental change detection
 │   └── tantivy_index.rs       # BM25 full-text search index
 └── http/                # HTTP service layer
-    ├── server.rs        # CodeBaseServer: startup + routes
+    ├── server.rs        # CodeSeekServer: startup + routes
     ├── handlers/        # Request handlers (query / search / investigate / embed)
     └── models/          # Request/response data structures
 ```
@@ -352,7 +352,7 @@ Contributions are welcome! Whether it's submitting an issue, improving documenta
 
 ## 📄 License
 
-**MIT** © CodeActor
+**MIT** © CodeSeek
 
 Built with amazing open-source projects: Tree-sitter · Petgraph · LanceDB · Tantivy · Axum · Tokio · Clap
 

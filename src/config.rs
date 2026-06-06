@@ -4,25 +4,25 @@ use tracing::info;
 
 fn default_embedding_db_uri() -> String {
     let home = dirs::home_dir().unwrap_or_default();
-    home.join(".codeactor/data/embedding")
+    home.join(".codeseek/data/embedding")
         .to_string_lossy()
         .to_string()
 }
 
 fn default_graph_db_uri() -> String {
     let home = dirs::home_dir().unwrap_or_default();
-    home.join(".codeactor/data/graph")
+    home.join(".codeseek/data/graph")
         .to_string_lossy()
         .to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub codebase: CodeBaseConfig,
+    pub codebase: CodeSeekConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct CodeBaseConfig {
+pub struct CodeSeekConfig {
     #[serde(default)]
     pub enable_embedding: bool,
     #[serde(default = "default_embedding_db_uri")]
@@ -235,7 +235,7 @@ fn default_graph_max_nodes() -> usize { 10 }
 impl Config {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-        let config_path = home_dir.join(".codeactor/config/config.toml");
+        let config_path = home_dir.join(".codeseek/config/config.toml");
 
         info!("Loading configuration from: {:?}", config_path);
 

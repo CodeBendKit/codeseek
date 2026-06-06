@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CodeActor Semantic Search 功能测试脚本
+CodeSeek Semantic Search 功能测试脚本
 
 测试 codebase 语义搜索接口（运行在本地 12800 端口）的准确性，
 特别关注混合检索（Hybrid Search）与纯 Embedding 检索的对比分析。
@@ -1046,7 +1046,7 @@ def main():
     """主测试流程"""
     print()
     cprint("======================================================================", Colors.BOLD)
-    cprint("  CodeActor Semantic Search 功能测试报告", Colors.BOLD + Colors.CYAN)
+    cprint("  CodeSeek Semantic Search 功能测试报告", Colors.BOLD + Colors.CYAN)
     cprint("======================================================================", Colors.BOLD)
     cprint(f"\n  服务地址: {BASE_URL}", Colors.DIM)
     cprint(f"  测试时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n", Colors.DIM)
