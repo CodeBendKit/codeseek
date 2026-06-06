@@ -8,7 +8,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc",
-    "postinstall": "node dist/install/download.js",
+    "postinstall": "node -e \"var f='dist/install/download.js';require('fs').existsSync(f)&&require('./'+f)\" || true",
     "preuninstall": "echo 'Run codeseek uninstall-hooks to clean up git hooks'",
     "prepublishOnly": "npm run build"
   },
