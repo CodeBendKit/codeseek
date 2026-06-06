@@ -5,16 +5,16 @@ class Codeseek < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.2/codeseek-darwin-arm64"
+      url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.3/codeseek-darwin-arm64"
       sha256 "REPLACE_WITH_ACTUAL_SHA256"
     else
-      url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.2/codeseek-darwin-x64"
+      url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.3/codeseek-darwin-x64"
       sha256 "REPLACE_WITH_ACTUAL_SHA256"
     end
   end
 
   on_linux do
-    url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.2/codeseek-linux-x64"
+    url "https://github.com/CodeBendKit/codeseek/releases/download/v0.1.3/codeseek-linux-x64"
     sha256 "REPLACE_WITH_ACTUAL_SHA256"
   end
 
