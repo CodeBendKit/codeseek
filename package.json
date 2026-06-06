@@ -1,0 +1,30 @@
+{
+  "name": "codeseek",
+  "version": "0.1.0",
+  "description": "Code intelligence CLI tool — AST analysis + semantic search for Claude Code",
+  "bin": {
+    "codeseek": "./dist/bin/codeseek.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "postinstall": "node dist/install/download.js",
+    "preuninstall": "echo 'Run codeseek uninstall-hooks to clean up git hooks'",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist/"
+  ],
+  "keywords": [
+    "code-intelligence",
+    "semantic-search",
+    "call-graph",
+    "code-analysis",
+    "claude-code",
+    "mcp"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -3,6 +3,9 @@
 ## Build & Test
 
 ```bash
+# Enter Rust project directory
+cd rust-core
+
 # Build
 cargo build
 
