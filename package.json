@@ -1,10 +1,8 @@
 {
   "name": "codeseek",
-  "version": "0.1.0",
+  "version": "0.1.9",
   "description": "Code intelligence CLI tool — AST analysis + semantic search for Claude Code",
-  "bin": {
-    "codeseek": "./dist/bin/codeseek.js"
-  },
+  "bin": "dist/bin/codeseek.js",
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc",
