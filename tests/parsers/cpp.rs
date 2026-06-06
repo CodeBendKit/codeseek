@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::fs::canonicalize;
     use std::path::PathBuf;
 
     use crate::codegraph::treesitter::language_id::LanguageId;
@@ -8,12 +7,12 @@ mod tests {
     use crate::codegraph::treesitter::parsers::cpp::CppParser;
     use crate::codegraph::treesitter::parsers::tests::{base_declaration_formatter_test, base_parser_test, base_skeletonizer_test};
 
-    const MAIN_CPP_CODE: &str = include_str!("cases/cpp/main.cpp");
-    const MAIN_CPP_SYMBOLS: &str = include_str!("cases/cpp/main.cpp.json");
+    const MAIN_CPP_CODE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/cpp/main.cpp"));
+    const MAIN_CPP_SYMBOLS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/cpp/main.cpp.json"));
 
-    const CIRCLE_CPP_CODE: &str = include_str!("cases/cpp/circle.cpp");
-    const CIRCLE_CPP_SKELETON: &str = include_str!("cases/cpp/circle.cpp.skeleton");
-    const CIRCLE_CPP_DECLS: &str = include_str!("cases/cpp/circle.cpp.decl_json");
+    const CIRCLE_CPP_CODE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/cpp/circle.cpp"));
+    const CIRCLE_CPP_SKELETON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/cpp/circle.cpp.skeleton"));
+    const CIRCLE_CPP_DECLS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/cpp/circle.cpp.decl_json"));
 
     #[test]
     fn parser_test() {
@@ -25,7 +24,7 @@ mod tests {
     #[test]
     fn skeletonizer_test() {
         let mut parser: Box<dyn AstLanguageParser> = Box::new(CppParser::new().expect("CppParser::new"));
-        let file = canonicalize(PathBuf::from(file!())).unwrap().parent().unwrap().join("cases/cpp/circle.cpp");
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cases/cpp/circle.cpp");
         assert!(file.exists());
 
         base_skeletonizer_test(&LanguageId::Cpp, &mut parser, &file, CIRCLE_CPP_CODE, CIRCLE_CPP_SKELETON);
@@ -34,7 +33,7 @@ mod tests {
     #[test]
     fn declaration_formatter_test() {
         let mut parser: Box<dyn AstLanguageParser> = Box::new(CppParser::new().expect("CppParser::new"));
-        let file = canonicalize(PathBuf::from(file!())).unwrap().parent().unwrap().join("cases/cpp/circle.cpp");
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cases/cpp/circle.cpp");
         assert!(file.exists());
         base_declaration_formatter_test(&LanguageId::Cpp, &mut parser, &file, CIRCLE_CPP_CODE, CIRCLE_CPP_DECLS);
     }

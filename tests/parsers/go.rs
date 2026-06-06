@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::fs::canonicalize;
     use std::path::PathBuf;
 
     use crate::codegraph::treesitter::language_id::LanguageId;
@@ -9,17 +8,17 @@ mod tests {
     use crate::codegraph::treesitter::parsers::tests::{base_declaration_formatter_test, base_parser_test, base_skeletonizer_test};
     use crate::codegraph::treesitter::structs::SymbolType;
 
-    const MAIN_GO_CODE: &str = include_str!("cases/go/main.go");
-    const MAIN_GO_SYMBOLS: &str = include_str!("cases/go/main.go.json");
+    const MAIN_GO_CODE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/main.go"));
+    const MAIN_GO_SYMBOLS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/main.go.json"));
 
-    const SHAPE_GO_CODE: &str = include_str!("cases/go/shape.go");
-    const SHAPE_GO_SKELETON: &str = include_str!("cases/go/shape.go.skeleton");
-    const SHAPE_GO_DECLS: &str = include_str!("cases/go/shape.go.decl_json");
+    const SHAPE_GO_CODE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/shape.go"));
+    const SHAPE_GO_SKELETON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/shape.go.skeleton"));
+    const SHAPE_GO_DECLS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/shape.go.decl_json"));
 
     #[test]
     fn parser_test() {
-        let code = include_str!("./cases/go/main.go");
-        let symbols_str = include_str!("./cases/go/main.go.json");
+        let code = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/main.go"));
+        let symbols_str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/main.go.json"));
         let path = std::path::PathBuf::from("/main.go");
         let mut parser: Box<dyn AstLanguageParser> = Box::new(GoParser::new().expect("GoParser::new"));
         
@@ -29,7 +28,7 @@ mod tests {
     #[test]
     fn skeletonizer_test() {
         let mut parser: Box<dyn AstLanguageParser> = Box::new(GoParser::new().expect("GoParser::new"));
-        let file = canonicalize(PathBuf::from(file!())).unwrap().parent().unwrap().join("cases/go/shape.go");
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cases/go/shape.go");
         assert!(file.exists());
 
         base_skeletonizer_test(&LanguageId::Go, &mut parser, &file, SHAPE_GO_CODE, SHAPE_GO_SKELETON);
@@ -38,7 +37,7 @@ mod tests {
     #[test]
     fn declaration_formatter_test() {
         let mut parser: Box<dyn AstLanguageParser> = Box::new(GoParser::new().expect("GoParser::new"));
-        let file = canonicalize(PathBuf::from(file!())).unwrap().parent().unwrap().join("cases/go/shape.go");
+        let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cases/go/shape.go");
         assert!(file.exists());
         base_declaration_formatter_test(&LanguageId::Go, &mut parser, &file, SHAPE_GO_CODE, SHAPE_GO_DECLS);
     }
@@ -92,7 +91,7 @@ func main() {
 
     #[test]
     fn debug_shape_parsing() {
-        let code = include_str!("./cases/go/shape.go");
+        let code = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cases/go/shape.go"));
         let path = std::path::PathBuf::from("/shape.go");
         let mut parser: Box<dyn AstLanguageParser> = Box::new(GoParser::new().expect("GoParser::new"));
         

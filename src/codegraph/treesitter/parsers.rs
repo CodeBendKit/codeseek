@@ -11,6 +11,7 @@ use crate::codegraph::treesitter::language_id::LanguageId;
 pub(crate) mod python;
 pub(crate) mod rust;
 #[cfg(test)]
+#[path = "../../../tests/parsers/mod.rs"]
 mod tests;
 mod utils;
 mod java;
