@@ -138,6 +138,24 @@ impl PetCodeGraph {
         node_index
     }
 
+    /// 删除指定文件的所有函数及其调用关系（增量更新时使用）
+    pub fn remove_functions_by_file(&mut self, file_path: &PathBuf) {
+        if let Some(function_ids) = self.file_functions.remove(file_path) {
+            for id in &function_ids {
+                if let Some(node_index) = self.function_to_node.remove(id) {
+                    self.node_to_function.remove(&node_index);
+                    // Remove all edges connected to this node
+                    self.graph.remove_node(node_index);
+                }
+                self.function_names.iter_mut().for_each(|(_, ids)| {
+                    ids.retain(|x| x != id);
+                });
+                self.function_names.retain(|_, ids| !ids.is_empty());
+            }
+            self.stats.total_functions -= function_ids.len();
+        }
+    }
+
     /// 添加调用关系边
     pub fn add_call_relation(&mut self, relation: CallRelation) -> Result<(), String> {
         let caller_node = self.function_to_node.get(&relation.caller_id)

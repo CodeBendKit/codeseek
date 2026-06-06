@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn, error};
+use codeseek::ui::progress::ProgressBar;
 
 /// 从当前工作目录检测项目根（向上找 .git/）
 fn detect_project() -> Result<PathBuf, String> {
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if cli.verbose {
                 tracing_subscriber::EnvFilter::new("debug")
             } else {
-                tracing_subscriber::EnvFilter::new("info")
+                tracing_subscriber::EnvFilter::new("warn")
             }
         });
     tracing_subscriber::fmt().with_env_filter(filter_layer).init();
@@ -49,53 +50,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (index_dir, lock_path) = project_paths(&project_root);
             let _lock = FileLock::exclusive(lock_path)?;
 
-            info!("Initializing index for project: {:?}", project_root);
-            info!("Index directory: {:?}", index_dir);
+            eprintln!("  Project:    {}", project_root.display());
+            eprintln!("  Index dir:  {}", index_dir.display());
+            eprintln!();
 
-            // Use CodeAnalyzer to parse and build graph
+            let project_hash = Config::compute_project_hash(&project_root);
+            let storage = Arc::new(StorageManager::new());
+
+            // Try loading existing graph for incremental update
+            let existing_graph = storage.get_persistence().load_graph(&project_hash).ok().flatten();
+
+            // Phase 1: Parse files
+            let pb = ProgressBar::start("Parsing source files...");
             let mut analyzer = CodeAnalyzer::new();
             let result = analyzer.analyze_directory(&project_root);
-            match result {
-                Ok(code_graph) => {
-                    let stats = code_graph.get_stats();
-                    let mut pet_graph = PetCodeGraph::new();
-                    for func in code_graph.functions.values() {
-                        pet_graph.add_function(func.clone());
-                    }
-                    for rel in &code_graph.call_relations {
-                        let _ = pet_graph.add_call_relation(rel.clone());
-                    }
-                    pet_graph.update_stats();
-
-                    let project_hash = Config::compute_project_hash(&project_root);
-                    let storage = Arc::new(StorageManager::new());
-                    storage.get_persistence().save_graph(&project_hash, &pet_graph)?;
-                    storage.set_graph(pet_graph);
-
-                    println!("Index built successfully:");
-                    println!("  Project:   {:?}", project_root);
-                    println!("  Functions: {}", stats.total_functions);
-                    println!("  Files:     {}", stats.total_files);
-
-                    // Trigger embedding build if configured
-                    if let Some(ref cfg) = config {
-                        if !cfg.embedding.api_token.is_empty() {
-                            info!("Starting embedding build...");
-                            let db_path = index_dir.to_string_lossy().to_string();
-                            let collection = format!("codeseek_{}", &project_hash[..8]);
-                            if let Ok(es) = EmbeddingService::new(&db_path, collection, None, None).await {
-                                // Embedding build will be done in Phase 2 task 12
-                                let _ = es;
-                                info!("Embedding service initialized");
-                            }
-                        }
-                    }
-                }
+            let code_graph = match result {
+                Ok(g) => g,
                 Err(e) => {
-                    error!("Failed to analyze project: {:?}", e);
+                    pb.finish("failed");
                     return Err(format!("Analysis failed: {}", e).into());
                 }
+            };
+            let new_stats = code_graph.get_stats();
+            pb.set_files(new_stats.total_files);
+            pb.set_funcs(new_stats.total_functions);
+
+            // Phase 2: Build graph — merge new results into existing or build fresh
+            pb.set_phase("Building call graph...");
+            let mut pet_graph = existing_graph.unwrap_or_else(|| PetCodeGraph::new());
+
+            if new_stats.total_functions > 0 {
+                // Remove old entries from files that were re-parsed
+                let changed_files: std::collections::HashSet<_> = code_graph.functions.values()
+                    .map(|f| f.file_path.clone())
+                    .collect();
+                for file in &changed_files {
+                    pet_graph.remove_functions_by_file(file);
+                }
+                // Add new entries
+                for func in code_graph.functions.values() {
+                    pet_graph.add_function(func.clone());
+                }
+                for rel in &code_graph.call_relations {
+                    let _ = pet_graph.add_call_relation(rel.clone());
+                }
+                pet_graph.update_stats();
             }
+
+            // Phase 3: Save
+            pb.set_phase("Saving index...");
+            let stats = pet_graph.get_stats().clone();
+            storage.get_persistence().save_graph(&project_hash, &pet_graph)?;
+            storage.set_graph(pet_graph);
+
+            pb.finish("Index built");
         }
         Commands::Status { json } => {
             let project_root = detect_project()?;
@@ -213,6 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let results = execute_callers(&graph, symbol, *json)?;
                     if !*json && results.trim().is_empty() {
                         println!("No callers found for '{}'", symbol);
+                    } else {
+                        print!("{}", results);
                     }
                 }
                 _ => {
@@ -233,6 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let results = execute_callees(&graph, symbol, *json)?;
                     if !*json && results.trim().is_empty() {
                         println!("No callees found for '{}'", symbol);
+                    } else {
+                        print!("{}", results);
                     }
                 }
                 _ => {

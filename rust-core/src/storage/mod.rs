@@ -15,6 +15,7 @@ pub use tantivy_index::TantivyBm25Index;
 
 use std::sync::Arc;
 use parking_lot::RwLock;
+use dirs;
 use crate::codegraph::types::PetCodeGraph;
 use crate::cli::args::StorageMode;
 use crate::config::Config;
@@ -36,9 +37,8 @@ impl StorageManager {
     }
 
     pub fn with_storage_mode(storage_mode: StorageMode) -> Self {
-        let base_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".codegraph_db");
+        let home = dirs::home_dir().unwrap_or_default();
+        let base_dir = home.join(".codeseek");
 
         Self {
             persistence: Arc::new(PersistenceManager::with_storage_mode(storage_mode.clone(), base_dir)),

@@ -42,7 +42,7 @@ function binaryExists(): boolean {
  * Uses readline for compatibility (no @clack/prompts dependency needed for basic use).
  */
 async function runSetupWizard(): Promise<void> {
-  const readline = require("readline");
+  const readline = await import("readline");
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,

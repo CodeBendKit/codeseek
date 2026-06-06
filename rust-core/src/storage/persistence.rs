@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::fs;
 use std::io;
+use dirs;
 use std::collections::HashMap;
 use crate::codegraph::types::PetCodeGraph;
 use crate::storage::petgraph_storage::PetGraphStorageManager;
@@ -28,9 +29,8 @@ struct ProjectsRegistry {
 
 impl PersistenceManager {
     pub fn new() -> Self {
-        let base_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".codeseek_data");
+        let home = dirs::home_dir().unwrap_or_default();
+        let base_dir = home.join(".codeseek");
         Self::with_storage_mode(StorageMode::default(), base_dir)
     }
 
@@ -273,23 +273,72 @@ impl PersistenceManager {
 
 impl crate::storage::traits::GraphPersistence for PersistenceManager {
     fn save_graph(&self, project_id: &str, graph: &PetCodeGraph) -> io::Result<()> {
-        Self::save_graph(self, project_id, graph)
+        let project_dir = self.base_dir.join(project_id);
+        fs::create_dir_all(&project_dir)?;
+
+        match self.storage_mode {
+            StorageMode::Json => {
+                self.save_graph_json(project_id, graph)?;
+            },
+            StorageMode::Binary => {
+                self.save_graph_binary(project_id, graph)?;
+            },
+            StorageMode::Both => {
+                self.save_graph_json(project_id, graph)?;
+                self.save_graph_binary(project_id, graph)?;
+            },
+        }
+        Ok(())
     }
 
     fn load_graph(&self, project_id: &str) -> io::Result<Option<PetCodeGraph>> {
-        Self::load_graph(self, project_id)
+        match self.storage_mode {
+            StorageMode::Json => self.load_graph_json(project_id),
+            StorageMode::Binary => self.load_graph_binary(project_id),
+            StorageMode::Both => {
+                match self.load_graph_binary(project_id) {
+                    Ok(Some(graph)) => Ok(Some(graph)),
+                    _ => self.load_graph_json(project_id),
+                }
+            },
+        }
     }
 
     fn save_file_hash(&self, project_id: &str, file_path: &str, hash: &str) -> io::Result<()> {
-        Self::save_file_hash(self, project_id, file_path, hash)
+        let project_dir = self.base_dir.join(project_id);
+        fs::create_dir_all(&project_dir)?;
+
+        let hashes_file = project_dir.join("file_hashes.json");
+        let mut hashes: HashMap<String, String> = if hashes_file.exists() {
+            let content = fs::read_to_string(&hashes_file)?;
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        hashes.insert(file_path.to_string(), hash.to_string());
+
+        let json = serde_json::to_string_pretty(&hashes)?;
+        fs::write(&hashes_file, json)?;
+        Ok(())
     }
 
     fn load_file_hashes(&self, project_id: &str) -> io::Result<HashMap<String, String>> {
-        Self::load_file_hashes(self, project_id)
+        let hashes_file = self.base_dir.join(project_id).join("file_hashes.json");
+        if !hashes_file.exists() {
+            return Ok(HashMap::new());
+        }
+        let content = fs::read_to_string(&hashes_file)?;
+        let hashes: HashMap<String, String> = serde_json::from_str(&content).unwrap_or_default();
+        Ok(hashes)
     }
 
     fn delete_project(&self, project_id: &str) -> io::Result<()> {
-        Self::delete_project(self, project_id)
+        let project_dir = self.base_dir.join(project_id);
+        if project_dir.exists() {
+            fs::remove_dir_all(project_dir)?;
+        }
+        Ok(())
     }
 
     fn list_projects(&self) -> io::Result<Vec<String>> {
