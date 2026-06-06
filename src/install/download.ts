@@ -6,29 +6,32 @@
 
 import * as https from "https";
 import * as fs from "fs";
-import * as path from "path";
 import * as os from "os";
 
-const REPO_OWNER = "wenwang";
+const REPO_OWNER = "CodeBendKit";
 const REPO_NAME = "codeseek";
-const VERSION = "v0.1.0";
+const VERSION = "v0.1.3";
 
-function getPlatformSuffix(): string {
+function getPlatformSuffix(): { suffix: string; exe: boolean } {
   const platform = os.platform();
   const arch = os.arch();
 
   if (platform === "darwin") {
-    return arch === "arm64" ? "darwin-arm64" : "darwin-x64";
+    return { suffix: arch === "arm64" ? "darwin-arm64" : "darwin-x64", exe: false };
   }
   if (platform === "linux") {
-    return arch === "arm64" ? "linux-arm64" : "linux-x64";
+    return { suffix: "linux-x64", exe: false };
+  }
+  if (platform === "win32") {
+    return { suffix: "win32-x64", exe: true };
   }
   throw new Error(`Unsupported platform: ${platform}-${arch}`);
 }
 
 function getDownloadUrl(): string {
-  const suffix = getPlatformSuffix();
-  return `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/codeseek-${suffix}`;
+  const { suffix, exe } = getPlatformSuffix();
+  const ext = exe ? ".exe" : "";
+  return `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/codeseek-${suffix}${ext}`;
 }
 
 export function downloadBinary(destPath: string): Promise<void> {

@@ -21,6 +21,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             suffix: linux-x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: win32-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -40,15 +43,21 @@ jobs:
           cd rust-core
           cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           cp rust-core/target/${{ matrix.target }}/release/codeseek codeseek-${{ matrix.suffix }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp rust-core/target/${{ matrix.target }}/release/codeseek.exe codeseek-${{ matrix.suffix }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: codeseek-${{ matrix.suffix }}
-          path: codeseek-${{ matrix.suffix }}
+          path: codeseek-${{ matrix.suffix }}*
 
   release:
     name: Create Release
@@ -69,6 +78,7 @@ jobs:
           cp artifacts/codeseek-darwin-x64/codeseek-darwin-x64 release/
           cp artifacts/codeseek-darwin-arm64/codeseek-darwin-arm64 release/
           cp artifacts/codeseek-linux-x64/codeseek-linux-x64 release/
+          cp artifacts/codeseek-win32-x64/codeseek-win32-x64.exe release/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1

@@ -21,7 +21,8 @@ const HOME = os.homedir();
 const CODESEEK_DIR = path.join(HOME, ".codeseek");
 const CONFIG_PATH = path.join(CODESEEK_DIR, "config.json");
 const BIN_DIR = path.join(CODESEEK_DIR, "bin");
-const BIN_PATH = path.join(BIN_DIR, "codeseek");
+const BIN_NAME = process.platform === "win32" ? "codeseek.exe" : "codeseek";
+const BIN_PATH = path.join(BIN_DIR, BIN_NAME);
 
 function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) {
