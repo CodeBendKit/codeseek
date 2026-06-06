@@ -10,7 +10,7 @@ import * as os from "os";
 
 const REPO_OWNER = "CodeBendKit";
 const REPO_NAME = "codeseek";
-const VERSION = "v0.1.3";
+const VERSION = "v0.1.10";
 
 function getPlatformSuffix(): { suffix: string; exe: boolean } {
   const platform = os.platform();
