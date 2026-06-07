@@ -19,7 +19,17 @@
     "call-graph",
     "code-analysis",
     "claude-code",
-    "mcp"
+    "mcp",
+    "codex",
+    "hybrid-search",
+    "reranker",
+    "cross-encoder",
+    "embedding",
+    "tree-sitter",
+    "bm25",
+    "lancedb",
+    "rust",
+    "cli"
   ],
   "license": "MIT",
   "engines": {
