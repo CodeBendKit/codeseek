@@ -60,6 +60,22 @@ pub fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "codeseek_init".into(),
+            description: "Build or update the code index for the current project. Run this first before using other codeseek tools. Idempotent — subsequent runs only re-process changed files.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
+            name: "codeseek_list".into(),
+            description: "List all projects that have been indexed by codeseek. Returns project root paths.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
             name: "codeseek_status".into(),
             description: "Index health check — files, symbols, last indexed time.".into(),
             input_schema: serde_json::json!({

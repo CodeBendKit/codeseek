@@ -96,6 +96,12 @@ fn handle_tools_call(id: Option<Value>, request: &Value) -> Option<Value> {
             let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             run_cli(&["callees", symbol, "--json"])
         }
+        "codeseek_init" => {
+            run_cli(&["init"])
+        }
+        "codeseek_list" => {
+            run_cli(&["list", "--json"])
+        }
         "codeseek_status" => {
             run_cli(&["status", "--json"])
         }
