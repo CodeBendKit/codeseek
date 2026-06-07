@@ -147,10 +147,38 @@ impl Config {
         home.join(".codeseek").join("bin")
     }
 
-    /// 项目索引目录: ~/.codeseek/<project_hash>/
+    /// 项目索引目录: ~/.codeseek/projects/<project_hash>/
     pub fn project_index_dir(project_hash: &str) -> PathBuf {
         let home = dirs::home_dir().unwrap_or_default();
-        home.join(".codeseek").join(project_hash)
+        home.join(".codeseek").join("projects").join(project_hash)
+    }
+
+    /// 全局共享缓存目录: ~/.codeseek/cache/
+    pub fn cache_dir() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".codeseek").join("cache")
+    }
+
+    /// 项目数据根目录: ~/.codeseek/projects/
+    pub fn projects_dir() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".codeseek").join("projects")
+    }
+
+    /// CodeSeek 全局配置根目录: ~/.codeseek/
+    pub fn codeseek_dir() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".codeseek")
+    }
+
+    /// 项目 LanceDB 向量数据库目录: ~/.codeseek/projects/<project_hash>/lancedb/
+    pub fn lancedb_dir(project_hash: &str) -> PathBuf {
+        Self::project_index_dir(project_hash).join("lancedb")
+    }
+
+    /// 项目 BM25 全文索引目录: ~/.codeseek/projects/<project_hash>/tantivy_bm25/
+    pub fn bm25_dir(project_hash: &str) -> PathBuf {
+        Self::project_index_dir(project_hash).join("tantivy_bm25")
     }
 
     /// 加载全局配置

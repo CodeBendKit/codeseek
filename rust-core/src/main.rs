@@ -204,10 +204,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !cfg.embedding.api_token.is_empty() {
                     let project_hash = Config::compute_project_hash(&project_root);
                     let collection = format!("codeseek_{}", &project_hash[..8]);
-                    let db_path = index_dir.to_string_lossy().to_string();
+                    // LanceDB 存储在项目目录下的 lancedb/ 子目录
+                    let db_path = Config::lancedb_dir(&project_hash).to_string_lossy().to_string();
 
                     if let Ok(es) = EmbeddingService::new(&db_path, collection, Some(cfg), None).await {
-                        let bm25_dir = index_dir.join("tantivy_bm25");
+                        // BM25 索引存储在项目目录下的 tantivy_bm25/ 子目录
+                        let bm25_dir = Config::bm25_dir(&project_hash);
                         let bm25_index = TantivyBm25Index::open_or_create(&bm25_dir)
                             .ok()
                             .map(|idx| Arc::new(idx) as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>);
@@ -382,14 +384,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List { json } => {
-            let codeseek_dir = dirs::home_dir().unwrap_or_default().join(".codeseek");
-            if !codeseek_dir.exists() {
+            let projects_dir = Config::projects_dir();
+            if !projects_dir.exists() {
                 println!("No indexed projects found.");
                 return Ok(());
             }
 
             let mut projects = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&codeseek_dir) {
+            if let Ok(entries) = std::fs::read_dir(&projects_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {

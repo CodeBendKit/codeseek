@@ -51,8 +51,14 @@ impl PersistenceManager {
         &self.storage_mode
     }
 
+    /// 获取项目数据目录: ~/.codeseek/projects/<project_id>/
+    fn project_dir(&self, project_id: &str) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".codeseek").join("projects").join(project_id)
+    }
+
     pub fn save_graph(&self, project_id: &str, graph: &PetCodeGraph) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         fs::create_dir_all(&project_dir)?;
         
         match self.storage_mode {
@@ -72,7 +78,7 @@ impl PersistenceManager {
     }
 
     fn save_graph_json(&self, project_id: &str, graph: &PetCodeGraph) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         let graph_file = project_dir.join("graph.json");
         
         PetGraphStorageManager::save_to_file(graph, &graph_file)
@@ -82,7 +88,7 @@ impl PersistenceManager {
     }
 
     fn save_graph_binary(&self, project_id: &str, graph: &PetCodeGraph) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         let graph_file = project_dir.join("graph.bin");
         
         PetGraphStorageManager::save_to_binary(graph, &graph_file)
@@ -106,7 +112,7 @@ impl PersistenceManager {
     }
 
     fn load_graph_json(&self, project_id: &str) -> io::Result<Option<PetCodeGraph>> {
-        let graph_file = self.base_dir.join(project_id).join("graph.json");
+        let graph_file = self.project_dir(project_id).join("graph.json");
         
         if !graph_file.exists() {
             return Ok(None);
@@ -119,7 +125,7 @@ impl PersistenceManager {
     }
 
     fn load_graph_binary(&self, project_id: &str) -> io::Result<Option<PetCodeGraph>> {
-        let graph_file = self.base_dir.join(project_id).join("graph.bin");
+        let graph_file = self.project_dir(project_id).join("graph.bin");
         
         if !graph_file.exists() {
             return Ok(None);
@@ -132,7 +138,7 @@ impl PersistenceManager {
     }
 
     pub fn save_file_hash(&self, project_id: &str, file_path: &str, hash: &str) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         fs::create_dir_all(&project_dir)?;
         
         let hash_file = project_dir.join("file_hashes.json");
@@ -151,7 +157,7 @@ impl PersistenceManager {
     }
 
     pub fn load_file_hashes(&self, project_id: &str) -> io::Result<HashMap<String, String>> {
-        let hash_file = self.base_dir.join(project_id).join("file_hashes.json");
+        let hash_file = self.project_dir(project_id).join("file_hashes.json");
         
         if !hash_file.exists() {
             return Ok(HashMap::new());
@@ -165,7 +171,7 @@ impl PersistenceManager {
     }
 
     pub fn delete_project(&self, project_id: &str) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         if project_dir.exists() {
             fs::remove_dir_all(project_dir)?;
         }
@@ -177,10 +183,11 @@ impl PersistenceManager {
     }
 
     pub fn list_projects(&self) -> io::Result<Vec<String>> {
+        let projects_dir = crate::config::Config::projects_dir();
         let mut projects = Vec::new();
         
-        if self.base_dir.exists() {
-            for entry in fs::read_dir(&self.base_dir)? {
+        if projects_dir.exists() {
+            for entry in fs::read_dir(&projects_dir)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     if let Some(name) = entry.file_name().to_str() {
@@ -195,7 +202,7 @@ impl PersistenceManager {
 
     /// 获取已保存的文件信息
     pub fn get_saved_files_info(&self, project_id: &str) -> io::Result<Vec<String>> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         let mut files = Vec::new();
         
         if !project_dir.exists() {
@@ -273,7 +280,7 @@ impl PersistenceManager {
 
 impl crate::storage::traits::GraphPersistence for PersistenceManager {
     fn save_graph(&self, project_id: &str, graph: &PetCodeGraph) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         fs::create_dir_all(&project_dir)?;
 
         match self.storage_mode {
@@ -305,7 +312,7 @@ impl crate::storage::traits::GraphPersistence for PersistenceManager {
     }
 
     fn save_file_hash(&self, project_id: &str, file_path: &str, hash: &str) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         fs::create_dir_all(&project_dir)?;
 
         let hashes_file = project_dir.join("file_hashes.json");
@@ -324,7 +331,7 @@ impl crate::storage::traits::GraphPersistence for PersistenceManager {
     }
 
     fn load_file_hashes(&self, project_id: &str) -> io::Result<HashMap<String, String>> {
-        let hashes_file = self.base_dir.join(project_id).join("file_hashes.json");
+        let hashes_file = self.project_dir(project_id).join("file_hashes.json");
         if !hashes_file.exists() {
             return Ok(HashMap::new());
         }
@@ -334,7 +341,7 @@ impl crate::storage::traits::GraphPersistence for PersistenceManager {
     }
 
     fn delete_project(&self, project_id: &str) -> io::Result<()> {
-        let project_dir = self.base_dir.join(project_id);
+        let project_dir = self.project_dir(project_id);
         if project_dir.exists() {
             fs::remove_dir_all(project_dir)?;
         }

@@ -250,9 +250,9 @@ impl EmbeddingService {
         // LanceDB connection (embedded)
         let connection = connect(db_path).execute().await?;
         
-        // Initialize Cache - use a subdirectory within db_path to keep cache
-        // isolated per service instance
-        let cache_dir = Path::new(db_path).join("_cache");
+        // Initialize Cache — 全局共享缓存，所有项目共用同一份
+        // 路径: ~/.codeseek/cache/embedding_cache.sqlite
+        let cache_dir = Config::cache_dir();
         fs::create_dir_all(&cache_dir)?;
         let cache = Arc::new(EmbeddingCache::new(cache_dir.join("embedding_cache.sqlite").to_str().unwrap())?);
 
@@ -303,9 +303,9 @@ impl EmbeddingService {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let connection = connect(db_path).execute().await?;
         
-        // Initialize Cache - use a subdirectory within db_path to keep cache
-        // isolated per service instance and avoid conflicts between tests
-        let cache_dir = Path::new(db_path).join("_cache");
+        // Initialize Cache — 全局共享缓存，所有项目共用同一份
+        // 路径: ~/.codeseek/cache/embedding_cache.sqlite
+        let cache_dir = Config::cache_dir();
         fs::create_dir_all(&cache_dir)?;
         let cache_path = cache_dir.join("embedding_cache.sqlite");
         let cache = Arc::new(EmbeddingCache::new(cache_path.to_str().unwrap())?);
