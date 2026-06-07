@@ -53,12 +53,12 @@ npm 包包含一个轻量的 JS wrapper，负责：
 |------|------|
 | macOS | arm64（Apple Silicon）、x64（Intel） |
 | Linux | x64 |
-| Windows | x64 |
 
-### Homebrew（即将推出）
+### Homebrew
 
 ```bash
-brew install CodeBendKit/tap/codeseek
+brew tap CodeBendKit/codeseek git@github.com:CodeBendKit/codeseek.git
+brew install codeseek
 ```
 
 ### 从源码编译

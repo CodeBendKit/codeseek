@@ -73,12 +73,14 @@ pub struct IndexConfig {
     pub enable_reranker: bool,
     #[serde(default)]
     pub hybrid: HybridSearchConfig,
+    #[serde(default)]
+    pub reranker: RerankerConfig,
 }
 
 fn default_min_code_block_length() -> usize { 16 }
 
 /// 重排序配置（保留向后兼容）
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RerankerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -107,6 +109,15 @@ impl Default for IndexConfig {
             min_code_block_length: default_min_code_block_length(),
             enable_reranker: false,
             hybrid: HybridSearchConfig::default(),
+            reranker: RerankerConfig {
+                enabled: false,
+                model: default_reranker_model(),
+                api_token: String::new(),
+                api_base_url: default_api_base_url(),
+                top_n: default_10(),
+                candidate_multiplier: default_5(),
+                timeout_secs: default_30(),
+            },
         }
     }
 }

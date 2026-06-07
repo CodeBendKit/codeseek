@@ -98,10 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             pb.set_pct(85);
 
-            // Phase 3: Save (85→100%)
-            pb.set_phase("Saving index to disk");
+            // Phase 3: Save graph (85→90%)
+            pb.set_phase("Saving call graph");
+            pb.set_pct(88);
 
-            // Write project metadata so list/hash lookup works
             let meta = serde_json::json!({
                 "project_root": project_root.to_string_lossy(),
                 "indexed_at": chrono::Utc::now().to_rfc3339(),
@@ -112,9 +112,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stats = pet_graph.get_stats().clone();
             storage.get_persistence().save_graph(&project_hash, &pet_graph)?;
             storage.set_graph(pet_graph);
+
+            // Phase 4: Embedding (90→100%) — only if API token configured
+            let mut embedding_done = false;
+            if let Some(ref cfg) = config {
+                if !cfg.embedding.api_token.is_empty() {
+                    pb.set_pct(90);
+                    pb.set_phase("Building vector embeddings...");
+                    pb.set_stats(stats.total_files, stats.total_functions);
+
+                    let db_path = index_dir.to_string_lossy().to_string();
+                    let collection = format!("codeseek_{}", &project_hash[..8]);
+
+                    embedding_done = true; // mark attempted; actual success tracked below
+                    match EmbeddingService::new(&db_path, collection, Some(cfg), None).await {
+                        Ok(es) => {
+                            if let Err(e) = es.ensure_collection().await {
+                                warn!("Embedding table setup failed: {}", e);
+                                embedding_done = false;
+                            } else {
+                                match es.vectorize_directory(
+                                    &project_root.to_string_lossy(),
+                                    None,
+                                ).await {
+                                    Ok(new_hashes) => {
+                                        pb.set_stats(new_hashes.len(), stats.total_functions);
+                                    }
+                                    Err(e) => {
+                                        warn!("Embedding not available (LanceDB issue): {}. Graph-based search will be used.", e);
+                                        embedding_done = false;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Embedding service unavailable: {}. Graph-based search will be used.", e);
+                            embedding_done = false;
+                        }
+                    }
+                }
+            }
             pb.set_pct(100);
 
-            pb.finish(&format!("{} files, {} functions", stats.total_files, stats.total_functions));
+            let suffix = if embedding_done { " + embeddings" } else { "" };
+            pb.finish(&format!("{} files, {} functions{}", stats.total_files, stats.total_functions, suffix));
         }
         Commands::Status { json } => {
             let project_root = detect_project()?;
@@ -175,19 +216,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         if let Some(bm25) = bm25_index {
                             let hybrid_cfg = &cfg.index.hybrid;
-                            let hybrid = HybridSearchService::new(
-                                Arc::new(es),
-                                bm25,
-                                HybridSearchConfig {
-                                    enable_sparse: hybrid_cfg.enable_bm25,
-                                    rrf_k: hybrid_cfg.rrf_k,
-                                    dense_limit: hybrid_cfg.vector_top_k,
-                                    sparse_limit: hybrid_cfg.bm25_top_k,
-                                    timeout_ms: 0,
-                                    short_code_threshold: hybrid_cfg.short_code_threshold,
-                                    short_code_penalty: hybrid_cfg.short_code_penalty,
-                                },
-                            );
+                            let reranker_cfg = &cfg.index.reranker;
+
+                            let hybrid = if reranker_cfg.enabled && !reranker_cfg.api_token.is_empty() {
+                                let reranker = codeseek::services::RerankerService::new(reranker_cfg.clone());
+                                HybridSearchService::with_reranker(
+                                    Arc::new(es),
+                                    bm25,
+                                    HybridSearchConfig {
+                                        enable_sparse: hybrid_cfg.enable_bm25,
+                                        rrf_k: hybrid_cfg.rrf_k,
+                                        dense_limit: hybrid_cfg.vector_top_k,
+                                        sparse_limit: hybrid_cfg.bm25_top_k,
+                                        timeout_ms: 0,
+                                        short_code_threshold: hybrid_cfg.short_code_threshold,
+                                        short_code_penalty: hybrid_cfg.short_code_penalty,
+                                    },
+                                    Some(reranker),
+                                )
+                            } else {
+                                HybridSearchService::new(
+                                    Arc::new(es),
+                                    bm25,
+                                    HybridSearchConfig {
+                                        enable_sparse: hybrid_cfg.enable_bm25,
+                                        rrf_k: hybrid_cfg.rrf_k,
+                                        dense_limit: hybrid_cfg.vector_top_k,
+                                        sparse_limit: hybrid_cfg.bm25_top_k,
+                                        timeout_ms: 0,
+                                        short_code_threshold: hybrid_cfg.short_code_threshold,
+                                        short_code_penalty: hybrid_cfg.short_code_penalty,
+                                    },
+                                )
+                            };
                             Some(hybrid.search(query, *limit).await.unwrap_or_default())
                         } else {
                             None

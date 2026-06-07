@@ -5,9 +5,9 @@
  *
  * Flow:
  * 1. Check ~/.codeseek/config.json exists
- *    -> No: Run interactive setup wizard
+ *    -> No: Run interactive setup wizard (explains embedding model, guides to get API token)
  * 2. Check ~/.codeseek/bin/codeseek exists
- *    -> No: Download platform binary
+ *    -> No: Download platform binary from GitHub Releases
  * 3. Pass-through args to Rust binary
  */
 
@@ -39,8 +39,7 @@ function binaryExists(): boolean {
 }
 
 /**
- * Simple interactive setup wizard.
- * Uses readline for compatibility (no @clack/prompts dependency needed for basic use).
+ * Interactive setup wizard with helpful guidance.
  */
 async function runSetupWizard(): Promise<void> {
   const readline = await import("readline");
@@ -52,31 +51,72 @@ async function runSetupWizard(): Promise<void> {
   const question = (q: string): Promise<string> =>
     new Promise((resolve) => rl.question(q, resolve));
 
-  console.log("\n  Welcome to CodeSeek!");
-  console.log("  Let's configure the embedding model for semantic search.\n");
+  // ── Welcome ──────────────────────────────────────────────
+  console.log("\n  ╔══════════════════════════════════════════════╗");
+  console.log(  "  ║        Welcome to CodeSeek!                  ║");
+  console.log(  "  ║  Code intelligence CLI for Claude Code       ║");
+  console.log(  "  ╚══════════════════════════════════════════════╝");
 
-  console.log("  Provider: openai-compatible (default)");
+  // ── Explain embedding model ──────────────────────────────
+  console.log("\n  ── About the Embedding Model ──\n");
+  console.log("  CodeSeek uses an embedding model to convert your code into");
+  console.log("  vectors for semantic search. This enables natural language");
+  console.log('  queries like "find authentication middleware" across your');
+  console.log("  entire codebase.\n");
+  console.log("  ℹ  Basic features (call graph, name search) work WITHOUT");
+  console.log("     an embedding model. You can skip this step now and");
+  console.log("     configure it later by re-running 'codeseek'.\n");
+
+  // ── Provider ────────────────────────────────────────────
+  console.log("  ── Step 1: Choose a Provider ──\n");
+  console.log("  Providers that offer compatible embedding APIs:");
+  console.log("    • SiliconFlow  — https://siliconflow.cn  (recommended, affordable)");
+  console.log("    • OpenAI       — https://platform.openai.com");
+  console.log("    • Any OpenAI-compatible API\n");
+
   const apiBaseUrl =
     (await question("  API Base URL [https://api.siliconflow.cn/v1]: ")) ||
     "https://api.siliconflow.cn/v1";
 
+  // ── Model ───────────────────────────────────────────────
+  console.log("\n  ── Step 2: Choose a Model ──\n");
+  console.log("  Recommended embedding models:");
+  console.log("    • Qwen/Qwen3-Embedding-4B  (SiliconFlow, free tier available)");
+  console.log("    • BAAI/bge-large-zh-v1.5   (Chinese-optimized)");
+  console.log("    • text-embedding-3-small    (OpenAI)\n");
+
   const model =
-    (await question("  Model [Qwen/Qwen3-Embedding-4B]: ")) ||
+    (await question("  Model name [Qwen/Qwen3-Embedding-4B]: ")) ||
     "Qwen/Qwen3-Embedding-4B";
 
+  // ── API Token ───────────────────────────────────────────
+  console.log("\n  ── Step 3: API Token ──\n");
+  console.log("  How to get an API token from SiliconFlow (recommended):");
+  console.log("    1. Visit https://cloud.siliconflow.cn/account/ak");
+  console.log("    2. Register or log in");
+  console.log("    3. Click 'Create API Key'");
+  console.log("    4. Copy the key (starts with 'sk-')");
+  console.log("");
+  console.log("  For OpenAI:");
+  console.log("    1. Visit https://platform.openai.com/api-keys");
+  console.log("    2. Create a new secret key\n");
+
   const apiToken = await question("  API Token: ");
-  if (!apiToken) {
-    console.log("\n  API Token is required. Aborting.");
+  if (!apiToken || apiToken.trim().length < 5) {
+    console.log("\n  ⚠  No valid API token provided.");
+    console.log("  Skipping embedding configuration for now.");
+    console.log("  You can re-run 'codeseek' anytime to configure it.\n");
     rl.close();
-    process.exit(1);
+    process.exit(0);
   }
 
+  // ── Save ────────────────────────────────────────────────
   const config = {
     embedding: {
       provider: "openai-compatible",
-      model,
-      api_token: apiToken,
-      api_base_url: apiBaseUrl,
+      model: model.trim(),
+      api_token: apiToken.trim(),
+      api_base_url: apiBaseUrl.trim(),
       dimensions: 2560,
     },
     index: {
@@ -91,13 +131,24 @@ async function runSetupWizard(): Promise<void> {
         short_code_threshold: 30,
         short_code_penalty: 0.5,
       },
+      reranker: {
+        enabled: false,
+        model: "BAAI/bge-reranker-v2-m3",
+        api_token: "",
+        api_base_url: "https://api.siliconflow.cn/v1",
+        top_n: 10,
+        candidate_multiplier: 5,
+        timeout_secs: 30,
+      },
     },
     installed_hooks: {},
   };
 
   ensureDir(path.dirname(CONFIG_PATH));
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-  console.log(`\n  Configuration saved to ${CONFIG_PATH}\n`);
+
+  console.log(`\n  ✓ Configuration saved to ${CONFIG_PATH}`);
+  console.log("  Next step: run 'codeseek init' to build your first index!\n");
 
   rl.close();
 }
@@ -126,7 +177,7 @@ async function main(): Promise<void> {
   try {
     fs.chmodSync(BIN_PATH, 0o755);
   } catch {
-    // ignore
+    // ignore on Windows
   }
 
   // Step 4: Pass through to Rust binary

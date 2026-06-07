@@ -53,12 +53,12 @@ Supported platforms:
 |----------|-------------|
 | macOS | arm64 (Apple Silicon), x64 (Intel) |
 | Linux | x64 |
-| Windows | x64 |
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```bash
-brew install CodeBendKit/tap/codeseek
+brew tap CodeBendKit/codeseek git@github.com:CodeBendKit/codeseek.git
+brew install codeseek
 ```
 
 ### From source
