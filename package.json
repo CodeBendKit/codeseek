@@ -1,6 +1,6 @@
 {
   "name": "codeseek",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Code intelligence CLI tool — AST analysis + semantic search for Claude Code",
   "bin": "dist/bin/codeseek.js",
   "main": "./dist/index.js",
