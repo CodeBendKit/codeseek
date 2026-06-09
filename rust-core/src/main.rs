@@ -121,11 +121,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pb.set_phase("Building vector embeddings...");
                     pb.set_stats(stats.total_files, stats.total_functions);
 
-                    let db_path = index_dir.to_string_lossy().to_string();
+                    let db_path = Config::lancedb_dir(&project_hash).to_string_lossy().to_string();
                     let collection = format!("codeseek_{}", &project_hash[..8]);
 
+                    // 创建BM25索引用于稀疏检索通道
+                    let bm25_dir = Config::bm25_dir(&project_hash);
+                    let bm25_index = TantivyBm25Index::open_or_create(&bm25_dir)
+                        .ok()
+                        .map(|idx| Arc::new(idx) as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>);
+
                     embedding_done = true; // mark attempted; actual success tracked below
-                    match EmbeddingService::new(&db_path, collection, Some(cfg), None).await {
+                    match EmbeddingService::new(&db_path, collection, Some(cfg), bm25_index).await {
                         Ok(es) => {
                             if let Err(e) = es.ensure_collection().await {
                                 warn!("Embedding table setup failed: {}", e);

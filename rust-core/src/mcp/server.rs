@@ -143,7 +143,7 @@ fn run_cli(args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new(&bin)
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .output()
         .map_err(|e| format!("Failed to run codeseek: {}", e))?;
 
@@ -152,6 +152,13 @@ fn run_cli(args: &[&str]) -> Result<String, String> {
             .map_err(|e| format!("Invalid UTF-8 output: {}", e))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("codeseek exited with {}: {}", output.status, stderr.trim()))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stderr.is_empty() && stdout.is_empty() {
+            Err(format!("codeseek exited with {}", output.status))
+        } else if stderr.is_empty() {
+            Err(format!("codeseek exited with {}: {}", output.status, stdout.trim()))
+        } else {
+            Err(format!("codeseek exited with {}: {}", output.status, stderr.trim()))
+        }
     }
 }
