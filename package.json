@@ -1,6 +1,6 @@
 {
   "name": "codeseek",
-  "version": "v0.1.22",
+  "version": "0.1.23",
   "description": "Code intelligence CLI for Claude Code — AST call graph analysis and hybrid semantic search (Dense + Sparse + RRF + Cross-Encoder Reranker) across 7 languages. Ships as MCP tools for Claude Code & Codex CLI.",
   "bin": "dist/bin/codeseek.js",
   "main": "./dist/index.js",
