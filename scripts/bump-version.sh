@@ -4,6 +4,13 @@
 
 set -e
 
+# Detect OS for sed in-place compatibility
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    SED_INPLACE=(-i '')
+else
+    SED_INPLACE=(-i)
+fi
+
 if [ -z "$1" ]; then
     echo "Usage: $0 <new-version>"
     echo "Example: $0 0.1.18"
@@ -18,14 +25,14 @@ echo "==> Bumping version to $NEW_VERSION..."
 cd "$ROOT"
 
 # 1. package.json (single source of truth)
-sed -i '' "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" package.json
+sed "${SED_INPLACE[@]}" "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" package.json
 
 # 2. rust-core/Cargo.toml
-sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" rust-core/Cargo.toml
+sed "${SED_INPLACE[@]}" "s/^version = \".*\"/version = \"$NEW_VERSION\"/" rust-core/Cargo.toml
 
 # 3. Formula/codeseek.rb
-sed -i '' "s/version \".*\"/version \"$NEW_VERSION\"/" Formula/codeseek.rb
-sed -i '' "s|download/v[0-9.]*/codeseek-|download/v$NEW_VERSION/codeseek-|g" Formula/codeseek.rb
+sed "${SED_INPLACE[@]}" "s/version \".*\"/version \"$NEW_VERSION\"/" Formula/codeseek.rb
+sed "${SED_INPLACE[@]}" "s|download/v[0-9.]*/codeseek-|download/v$NEW_VERSION/codeseek-|g" Formula/codeseek.rb
 
 # 4. package-lock.json
 npm install --package-lock-only 2>/dev/null || true
