@@ -10,7 +10,7 @@ impl CodeSeekRunner {
         Self
     }
 
-    pub async fn run(cli: Cli, config: Option<Config>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(cli: Cli, _config: Option<Config>) -> Result<(), Box<dyn std::error::Error>> {
         match cli.command {
             Commands::Init { interactive: _ } => {
                 info!("init command - to be implemented in Phase 2");

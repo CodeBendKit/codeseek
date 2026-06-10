@@ -215,7 +215,7 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
         }
 
         let embedding_response: EmbeddingResponse = response.json().await?;
-        let mut results: Vec<Vec<f32>> = embedding_response.data.into_iter()
+        let results: Vec<Vec<f32>> = embedding_response.data.into_iter()
             .map(|d| d.embedding)
             .collect();
 
@@ -402,8 +402,69 @@ impl EmbeddingService {
             }
         }
         
+        // Clean up embeddings for files that were deleted since last run
+        if let Some(hashes) = existing_hashes {
+            let mut deleted_count = 0;
+            for old_file in hashes.keys() {
+                if !new_hashes.contains_key(old_file) {
+                    info!("Cleaning up embeddings for deleted file: {}", old_file);
+                    if let Err(e) = self.delete_file_embeddings(old_file).await {
+                        error!("Failed to delete LanceDB embeddings for {}: {}", old_file, e);
+                    } else {
+                        deleted_count += 1;
+                    }
+                    // Also clean up BM25 index entries for the deleted file
+                    if let Some(ref bm25) = self.bm25_index {
+                        if let Err(e) = bm25.remove_by_path(old_file).await {
+                            error!("Failed to remove BM25 entries for {}: {}", old_file, e);
+                        }
+                    }
+                }
+            }
+            if deleted_count > 0 {
+                info!("Cleaned up embeddings for {} deleted files", deleted_count);
+            }
+        }
+
         info!("Vectorization completed. Total vectors created: {}", total_vectors);
         Ok(new_hashes)
+    }
+
+    /// Load persisted file hashes from project index directory.
+    /// Returns None if the hashes file doesn't exist or is corrupted.
+    pub fn load_hashes(project_hash: &str) -> Option<std::collections::HashMap<String, String>> {
+        let path = Config::project_index_dir(project_hash).join("embedding_hashes.json");
+        if !path.exists() {
+            return None;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to read embedding hashes file: {}", e);
+                return None;
+            }
+        };
+        let hashes: std::collections::HashMap<String, String> = match serde_json::from_str(&content) {
+            Ok(h) => h,
+            Err(e) => {
+                error!("Failed to parse embedding hashes: {}", e);
+                return None;
+            }
+        };
+        info!("Loaded {} file hashes from {:?}", hashes.len(), path);
+        Some(hashes)
+    }
+
+    /// Persist file hashes to project index directory.
+    pub fn save_hashes(project_hash: &str, hashes: &std::collections::HashMap<String, String>) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Config::project_index_dir(project_hash).join("embedding_hashes.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(hashes)?;
+        fs::write(&path, content)?;
+        info!("Saved {} file hashes to {:?}", hashes.len(), path);
+        Ok(())
     }
 
     /// Delete existing embeddings for a file
@@ -417,8 +478,16 @@ impl EmbeddingService {
 
     /// Process single file content
     async fn process_file_content(&self, file_path: &Path, _content: &str, ts_parser: &mut TreeSitterParser) -> Result<usize, Box<dyn std::error::Error>> {
-        // Delete existing embeddings for this file to prevent duplicates
+        // Delete existing LanceDB embeddings for this file to prevent duplicates
         self.delete_file_embeddings(&file_path.to_string_lossy()).await?;
+
+        // Also clean up BM25 index entries for this file before re-adding
+        if let Some(ref bm25) = self.bm25_index {
+            let fp = file_path.to_string_lossy();
+            if let Err(e) = bm25.remove_by_path(&fp).await {
+                error!("Failed to remove BM25 entries for {}: {}", fp, e);
+            }
+        }
 
         // Parse with TreeSitter
         let symbols = ts_parser.parse_file(&file_path.to_path_buf())?;

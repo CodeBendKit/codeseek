@@ -11,7 +11,7 @@ use codeseek::storage::TantivyBm25Index;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use codeseek::ui::progress::ProgressBar;
 use codeseek::mcp;
 
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load().ok();
 
     match &cli.command {
-        Commands::Init { interactive } => {
+        Commands::Init { interactive: _ } => {
             let project_root = detect_project()?;
             let (index_dir, lock_path) = project_paths(&project_root);
             let _lock = FileLock::exclusive(lock_path)?;
@@ -137,12 +137,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("Embedding table setup failed: {}", e);
                                 embedding_done = false;
                             } else {
+                                // Load previous file hashes to detect deletions
+                                let existing_hashes = EmbeddingService::load_hashes(&project_hash);
                                 match es.vectorize_directory(
                                     &project_root.to_string_lossy(),
-                                    None,
+                                    existing_hashes.as_ref(),
                                 ).await {
                                     Ok(new_hashes) => {
                                         pb.set_stats(new_hashes.len(), stats.total_functions);
+                                        // Persist hashes for next incremental run
+                                        if let Err(e) = EmbeddingService::save_hashes(&project_hash, &new_hashes) {
+                                            warn!("Failed to save embedding hashes: {}", e);
+                                        }
                                     }
                                     Err(e) => {
                                         warn!("Embedding not available (LanceDB issue): {}. Graph-based search will be used.", e);
@@ -203,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Search { query, limit, json } => {
             let project_root = detect_project()?;
-            let (index_dir, lock_path) = project_paths(&project_root);
+            let (_index_dir, lock_path) = project_paths(&project_root);
             let _lock = FileLock::shared(lock_path)?;
 
             let results = if let Some(ref cfg) = config {
@@ -624,7 +630,7 @@ fn codex_config_path() -> PathBuf {
 
 fn install_to_claude() -> Result<(), Box<dyn std::error::Error>> {
     let local = claude_local_mcp_path();
-    let (mcp_path, settings_path, scope) = if std::env::current_dir()
+    let (mcp_path, settings_path, _scope) = if std::env::current_dir()
         .map(|d| d.join(".mcp.json").exists())
         .unwrap_or(false)
         || local.exists()
