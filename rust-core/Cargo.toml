@@ -13,6 +13,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
 chrono = { version = "=0.4.38", features = ["serde"] }
 
 # Async runtime
