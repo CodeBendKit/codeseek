@@ -465,7 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hooks_dir = git_dir.join("hooks");
             std::fs::create_dir_all(&hooks_dir)?;
 
-            let hook_script = "#!/bin/sh\n# CodeSeek auto-index hook\ncodeseek init\n";
+            let hook_script = "#!/bin/sh\n# CodeSeek auto-index hook (async, non-blocking)\nnohup codeseek init </dev/null >/dev/null 2>&1 &\n";
 
             for hook_name in &["post-commit", "post-merge"] {
                 let hook_path = hooks_dir.join(hook_name);
