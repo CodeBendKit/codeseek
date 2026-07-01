@@ -5,3 +5,4 @@ pub mod services;
 pub mod config;
 pub mod ui;
 pub mod mcp;
+pub mod watcher;

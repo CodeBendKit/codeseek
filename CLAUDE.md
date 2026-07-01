@@ -107,3 +107,17 @@ Config file at `~/.codeseek/config/config.toml`. Key sections:
 - LanceDB collection names: `format!("{}_{:x}", last_dir_name, md5(repo_path))`
 - Tree-sitter is linked as a system library (see `build.rs`)
 - Storage modes: `Json`, `Binary`, `Both` — configured via `--storage-mode` CLI flag
+
+<!-- CODESEEK_INJECTION -->
+# Code exploration: use CodeSeek MCP tools first
+
+Before any Grep/Glob/Bash for code search, try CodeSeek tools first.
+They give you AST-verified definitions with signatures and line numbers.
+
+Tool priority (use in this order):
+1. codeseek_search("query") — FIRST for finding code by name or behavior
+2. codeseek_callers("fn")   — REQUIRED before modifying any function
+3. codeseek_callees("fn")   — to understand internal dependencies
+4. Grep — ONLY for exact strings (error messages, UUIDs, log formats)
+5. Glob — ONLY when you already know the exact filename pattern
+<!-- /CODESEEK_INJECTION -->

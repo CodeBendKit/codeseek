@@ -70,7 +70,6 @@ impl CodeParser {
                 "inl" | "inc" | "tpp" | "tpl" |
                 "py" | "py3" | "pyx" |
                 "java" |
-                "js" | "jsx" |
                 "rs" |
                 "ts" |
                 "tsx" |
@@ -380,7 +379,6 @@ impl CodeParser {
             match ext.to_lowercase().as_str() {
                 "rs" => "rust".to_string(),
                 "py" | "py3" | "pyx" => "python".to_string(),
-                "js" | "jsx" => "javascript".to_string(),
                 "ts" | "tsx" => "typescript".to_string(),
                 "java" => "java".to_string(),
                 "cpp" | "cc" | "cxx" | "c++" | "c" | "h" | "hpp" | "hxx" | "hh" => "cpp".to_string(),

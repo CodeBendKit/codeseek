@@ -106,7 +106,6 @@ pub fn get_language_id_by_filename(filename: &PathBuf) -> Option<LanguageId> {
         "inl" | "inc" | "tpp" | "tpl" => Some(LanguageId::Cpp),
         "py" | "py3" | "pyx" => Some(LanguageId::Python),
         "java" => Some(LanguageId::Java),
-        "js" | "jsx" => Some(LanguageId::JavaScript),
         "rs" => Some(LanguageId::Rust),
         "ts" => Some(LanguageId::TypeScript),
         "tsx" => Some(LanguageId::TypeScriptReact),

@@ -4,6 +4,9 @@
 use std::io::{self, BufRead, Write};
 use serde_json::{Value, json};
 use super::tools::all_tools;
+use crate::config::Config;
+use crate::watcher;
+use tracing::{info, warn};
 
 /// Marker for detecting already-injected guidance (idempotency guard)
 const INJECTION_MARKER_START: &str = "<!-- CODESEEK_INJECTION -->";
@@ -30,9 +33,108 @@ Tool priority (use in this order):\n\
 const GUIDANCE_TARGET_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
-    // Auto-inject MCP usage guidance into CLAUDE.md and AGENTS.md
+    // ── Phase 1: Auto-inject MCP usage guidance ────────────────────
     maybe_inject_mcp_guidance();
 
+    // ── Phase 2: Detect project root ───────────────────────────────
+    let project_root = match Config::detect_project_root() {
+        Some(root) => {
+            info!("[mcp] Project root detected: {:?}", root);
+            root
+        }
+        None => {
+            warn!("[mcp] Not in a git repository — some tools require 'codeseek init' first");
+            // Continue without project — user can still use some tools
+            // But watcher and auto-init won't start
+            return run_stdio_loop_without_project().await;
+        }
+    };
+
+    // ── Phase 3: Auto-initialize index ─────────────────────────────
+    info!("[mcp] Running initial index build...");
+    let init_result = run_cli(&["init"]);
+    match &init_result {
+        Ok(output) => {
+            info!("[mcp] Initial index build completed");
+            // Print init output to stderr so it doesn't interfere with MCP stdio
+            if !output.trim().is_empty() {
+                eprintln!("{}", output.trim());
+            }
+        }
+        Err(e) => {
+            warn!("[mcp] Initial index build failed: {} (continuing anyway)", e);
+        }
+    }
+
+    // ── Phase 4: Start file watcher ────────────────────────────────
+    let _watcher_guard = match watcher::start_watcher(&project_root) {
+        Ok(guard) => {
+            info!("[mcp] File watcher started — index will auto-update on file changes");
+            Some(guard)
+        }
+        Err(e) => {
+            warn!("[mcp] Failed to start file watcher: {} (continuing without watching)", e);
+            None
+        }
+    };
+
+    // ── Phase 5: Main stdin loop ───────────────────────────────────
+    // Note: _watcher_guard lives for the duration of this function,
+    // keeping the file watcher alive until the MCP server shuts down.
+    let result = run_stdio_loop().await;
+
+    // ── Phase 6: Cleanup ───────────────────────────────────────────
+    info!("[mcp] MCP server shutting down");
+    // _watcher_guard is dropped here, which stops the file watcher
+
+    result
+}
+
+/// Run the MCP stdio loop without a project context (no auto-init, no watcher).
+async fn run_stdio_loop_without_project() -> Result<(), Box<dyn std::error::Error>> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = request.get("id").cloned();
+
+        let response = match method {
+            "initialize" => handle_initialize(id),
+            "notifications/initialized" => None, // no response for notifications
+            "tools/list" => handle_tools_list(id),
+            "tools/call" => handle_tools_call(id, &request),
+            _ => {
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("Method not found: {}", method)
+                    }
+                }))
+            }
+        };
+
+        if let Some(resp) = response {
+            writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
+            stdout.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the MCP stdio loop with project context (watcher is alive in background).
+async fn run_stdio_loop() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -87,7 +189,7 @@ fn handle_initialize(id: Option<Value>) -> Option<Value> {
                 "name": "codeseek",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Use codeseek_search to find symbols, codeseek_callers/codeseek_callees to trace call relationships, and codeseek_status to check index health.\n\nTool selection:\n- codeseek_search — quick symbol lookup (name → location)\n- codeseek_callers — who depends on this?\n- codeseek_callees — what does this depend on?\n- codeseek_status — is the index up to date?"
+            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Automatically indexes your project on startup and watches for file changes in real-time.\n\nTools:\n- codeseek_search — find symbols by name\n- codeseek_callers — who calls this function?\n- codeseek_callees — what does this function call?\n- codeseek_init — manually trigger re-index\n- codeseek_status — check index health\n- codeseek_list — list indexed projects"
         }
     }))
 }
