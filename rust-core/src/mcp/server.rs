@@ -1,17 +1,91 @@
 //! Minimal MCP stdio server (JSON-RPC 2.0).
 //! Reads from stdin, writes to stdout, delegates to CLI commands.
+//! Supports graceful shutdown with in-flight operation tracking.
 
-use std::io::{self, BufRead, Write};
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use serde_json::{Value, json};
 use super::tools::all_tools;
 use crate::config::Config;
 use crate::watcher;
+use tokio::sync::Notify;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
 
 /// Marker for detecting already-injected guidance (idempotency guard)
 const INJECTION_MARKER_START: &str = "<!-- CODESEEK_INJECTION -->";
 /// Closing marker
 const INJECTION_MARKER_END: &str = "<!-- /CODESEEK_INJECTION -->";
+
+/// MCP 服务器共享状态 — 协调优雅关闭
+pub struct McpState {
+    /// 关闭信号通知器（notify 优于轮询）
+    shutdown_notify: Notify,
+    /// 是否已请求关闭
+    shutdown_requested: AtomicBool,
+    /// 当前正在执行的可能影响 LanceDB 的操作数量
+    in_flight_ops: AtomicUsize,
+}
+
+impl McpState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shutdown_notify: Notify::new(),
+            shutdown_requested: AtomicBool::new(false),
+            in_flight_ops: AtomicUsize::new(0),
+        })
+    }
+
+    /// 请求关闭 — 设置标志并通知所有等待者
+    pub fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    /// 检查是否已请求关闭
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// 开始一个受保护的操作（返回 RAII Guard）
+    pub fn begin_operation(&self) -> OpGuard<'_> {
+        self.in_flight_ops.fetch_add(1, Ordering::SeqCst);
+        OpGuard { state: self }
+    }
+
+    /// 获取当前在途操作数
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight_ops.load(Ordering::SeqCst)
+    }
+
+    /// 等待所有在途操作完成，最多等待 timeout 时长
+    /// 返回 true=所有操作已结束，false=超时
+    pub async fn wait_for_completion(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.in_flight_ops.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+/// RAII Guard — Drop 时自动递减 in_flight_ops
+pub struct OpGuard<'a> {
+    state: &'a McpState,
+}
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        self.state.in_flight_ops.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The guidance content to inject
 const INJECTION_CONTENT: &str = "\n\
@@ -32,7 +106,16 @@ Tool priority (use in this order):\n\
 /// Target filenames for injection
 const GUIDANCE_TARGET_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 
+/// Run the MCP stdio server with graceful shutdown support.
+///
+/// When stdin closes (EOF) or SIGTERM/SIGINT is received, the server will:
+/// 1. Signal all waiting tasks to stop
+/// 2. Wait for in-flight operations (index/compact) to complete
+/// 3. Exit cleanly
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
+    // 创建共享状态
+    let state = McpState::new();
+
     // ── Phase 1: Auto-inject MCP usage guidance ────────────────────
     maybe_inject_mcp_guidance();
 
@@ -46,7 +129,7 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
             warn!("[mcp] Not in a git repository — some tools require 'codeseek init' first");
             // Continue without project — user can still use some tools
             // But watcher and auto-init won't start
-            return run_stdio_loop_without_project().await;
+            return run_stdio_loop_without_project(state).await;
         }
     };
 
@@ -78,55 +161,124 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Phase 5: Main stdin loop ───────────────────────────────────
-    // Note: _watcher_guard lives for the duration of this function,
-    // keeping the file watcher alive until the MCP server shuts down.
-    let result = run_stdio_loop().await;
+    // ── Phase 5: Main stdin loop (可中断版本) ───────────────────────
+    let result = run_stdio_loop_with_state(state.clone()).await;
 
-    // ── Phase 6: Cleanup ───────────────────────────────────────────
-    info!("[mcp] MCP server shutting down");
-    // _watcher_guard is dropped here, which stops the file watcher
+    // ── Phase 6: Graceful shutdown — wait for in-flight operations ──
+    info!("[mcp] MCP server shutting down, waiting for in-flight operations...");
+    let in_flight = state.in_flight_count();
+    if in_flight > 0 {
+        info!("[mcp] Waiting for {} operation(s) to complete (max 30s)...", in_flight);
+        let completed = state.wait_for_completion(Duration::from_secs(30)).await;
+        if completed {
+            info!("[mcp] All operations completed successfully");
+        } else {
+            warn!("[mcp] Timed out waiting for operations, forcing exit");
+        }
+    } else {
+        info!("[mcp] No in-flight operations, clean exit");
+    }
 
     result
 }
 
+/// Run CLI command with operation tracking for graceful shutdown.
+/// Uses spawn_blocking to avoid blocking the tokio runtime.
+async fn run_cli_tracked(args: &[&str], state: &McpState) -> Result<String, String> {
+    let _guard = state.begin_operation();
+    let args_str: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let display_str = args_str.join(" ");
+    info!("[mcp] Starting tracked CLI operation: codeseek {} (in-flight ops: {})",
+          display_str, state.in_flight_count());
+    
+    let args_vec = args_str.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let args_ref: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
+        run_cli(&args_ref)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+    
+    // _guard is dropped here, automatically decrementing in_flight_ops
+    info!("[mcp] Tracked CLI operation completed: codeseek {}", display_str);
+    Ok(result)
+}
+
 /// Run the MCP stdio loop without a project context (no auto-init, no watcher).
-async fn run_stdio_loop_without_project() -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+async fn run_stdio_loop_without_project(state: Arc<McpState>) -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn signal handler task
+    let state_signal = state.clone();
+    tokio::spawn(async move {
+        setup_signal_handler(state_signal).await;
+    });
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() { continue; }
+    let stdin = tokio::io::stdin();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
 
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = request.get("id").cloned();
-
-        let response = match method {
-            "initialize" => handle_initialize(id),
-            "notifications/initialized" => None, // no response for notifications
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, &request),
-            _ => {
-                Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("Method not found: {}", method)
-                    }
-                }))
+    loop {
+        tokio::select! {
+            // Check for shutdown signal
+            _ = state.shutdown_notify.notified() => {
+                info!("[mcp] Shutdown signal received, stopping message processing");
+                break;
             }
-        };
 
-        if let Some(resp) = response {
-            writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-            stdout.flush()?;
+            // Read stdin line
+            line_result = lines.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() { continue; }
+
+                        let request: Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let id = request.get("id").cloned();
+
+                        let response = match method {
+                            "initialize" => handle_initialize(id),
+                            "notifications/initialized" => None, // no response for notifications
+                            "tools/list" => handle_tools_list(id),
+                            "tools/call" => handle_tools_call(id, &request, &state).await,
+                            _ => {
+                                Some(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("Method not found: {}", method)
+                                    }
+                                }))
+                            }
+                        };
+
+                        if let Some(resp) = response {
+                            let stdout = tokio::io::stdout();
+                            let mut writer = tokio::io::BufWriter::new(stdout);
+                            let resp_str = serde_json::to_string(&resp)?;
+                            use tokio::io::AsyncWriteExt;
+                            let output = format!("{}\r\n", resp_str);
+                            writer.write_all(output.as_bytes()).await?;
+                            writer.flush().await?;
+                        }
+                    }
+                    Ok(None) => {
+                        // stdin EOF
+                        info!("[mcp] stdin EOF received, initiating graceful shutdown");
+                        state.request_shutdown();
+                        // Continue waiting (in-flight operations may need to complete)
+                        // Note: notify has been triggered, select! will re-enter shutdown branch
+                    }
+                    Err(e) => {
+                        warn!("[mcp] stdin read error: {}", e);
+                        state.request_shutdown();
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -134,42 +286,81 @@ async fn run_stdio_loop_without_project() -> Result<(), Box<dyn std::error::Erro
 }
 
 /// Run the MCP stdio loop with project context (watcher is alive in background).
-async fn run_stdio_loop() -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+/// This version supports graceful shutdown via signal or stdin EOF.
+async fn run_stdio_loop_with_state(state: Arc<McpState>) -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn signal handler task
+    let state_signal = state.clone();
+    tokio::spawn(async move {
+        setup_signal_handler(state_signal).await;
+    });
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() { continue; }
+    let stdin = tokio::io::stdin();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
 
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = request.get("id").cloned();
-
-        let response = match method {
-            "initialize" => handle_initialize(id),
-            "notifications/initialized" => None, // no response for notifications
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, &request),
-            _ => {
-                Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("Method not found: {}", method)
-                    }
-                }))
+    loop {
+        tokio::select! {
+            // Check for shutdown signal
+            _ = state.shutdown_notify.notified() => {
+                info!("[mcp] Shutdown signal received, stopping message processing");
+                break;
             }
-        };
 
-        if let Some(resp) = response {
-            writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-            stdout.flush()?;
+            // Read stdin line
+            line_result = lines.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() { continue; }
+
+                        let request: Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let id = request.get("id").cloned();
+
+                        let response = match method {
+                            "initialize" => handle_initialize(id),
+                            "notifications/initialized" => None, // no response for notifications
+                            "tools/list" => handle_tools_list(id),
+                            "tools/call" => handle_tools_call(id, &request, &state).await,
+                            _ => {
+                                Some(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("Method not found: {}", method)
+                                    }
+                                }))
+                            }
+                        };
+
+                        if let Some(resp) = response {
+                            let stdout = tokio::io::stdout();
+                            let mut writer = tokio::io::BufWriter::new(stdout);
+                            let resp_str = serde_json::to_string(&resp)?;
+                            use tokio::io::AsyncWriteExt;
+                            let output = format!("{}\r\n", resp_str);
+                            writer.write_all(output.as_bytes()).await?;
+                            writer.flush().await?;
+                        }
+                    }
+                    Ok(None) => {
+                        // stdin EOF
+                        info!("[mcp] stdin EOF received, initiating graceful shutdown");
+                        state.request_shutdown();
+                        // Continue waiting (in-flight operations may need to complete)
+                        // Note: notify has been triggered, select! will re-enter shutdown branch
+                    }
+                    Err(e) => {
+                        warn!("[mcp] stdin read error: {}", e);
+                        state.request_shutdown();
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -205,62 +396,117 @@ fn handle_tools_list(id: Option<Value>) -> Option<Value> {
     }))
 }
 
-fn handle_tools_call(id: Option<Value>, request: &Value) -> Option<Value> {
+/// Handle tool calls with state-aware operation tracking.
+/// For `codeseek_init`, uses tracked execution to support graceful shutdown.
+async fn handle_tools_call(id: Option<Value>, request: &Value, state: &McpState) -> Option<Value> {
     let params = request.get("params")?;
     let tool_name = params.get("name")?.as_str()?;
-    let default_args = json!({});
-    let arguments = params.get("arguments").unwrap_or(&default_args);
 
-    let result = match tool_name {
+    // Check if shutdown has been requested
+    if state.is_shutdown_requested() {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": "Server is shutting down"
+            }
+        }));
+    }
+
+    // Use spawn_blocking to avoid blocking the tokio runtime
+    let args: Vec<String> = match tool_name {
         "codeseek_search" => {
-            let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
-            run_cli(&["search", query, "--limit", &limit.to_string(), "--json"])
+            let query = params.get("arguments")
+                .and_then(|v| v.get("query"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = params.get("arguments")
+                .and_then(|v| v.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10);
+            vec!["search".to_string(), query, "--limit".to_string(), limit.to_string(), "--json".to_string()]
         }
         "codeseek_callers" => {
-            let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            run_cli(&["callers", symbol, "--json"])
+            let symbol = params.get("arguments")
+                .and_then(|v| v.get("symbol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec!["callers".to_string(), symbol, "--json".to_string()]
         }
         "codeseek_callees" => {
-            let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            run_cli(&["callees", symbol, "--json"])
+            let symbol = params.get("arguments")
+                .and_then(|v| v.get("symbol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec!["callees".to_string(), symbol, "--json".to_string()]
         }
         "codeseek_init" => {
-            run_cli(&["init"])
+            // Use tracked execution for init (may trigger LanceDB compact)
+            return match run_cli_tracked(&["init"], state).await {
+                Ok(output) => Some(format_output(id, output)),
+                Err(e) => Some(format_error(id, e)),
+            };
         }
         "codeseek_list" => {
-            run_cli(&["list", "--json"])
+            vec!["list".to_string(), "--json".to_string()]
         }
         "codeseek_status" => {
-            run_cli(&["status", "--json"])
+            vec!["status".to_string(), "--json".to_string()]
         }
-        _ => Err(format!("Unknown tool: {}", tool_name)),
+        _ => return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("Unknown tool: {}", tool_name)
+            }
+        })),
+    };
+
+    // Execute the CLI command via spawn_blocking
+    let result = match tokio::task::spawn_blocking(move || {
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_cli(&args_ref)
+    }).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("Task join error: {}", e)),
     };
 
     match result {
-        Ok(output) => {
-            let content = if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
-                json!([{ "type": "text", "text": serde_json::to_string_pretty(&parsed).unwrap_or(output) }])
-            } else {
-                json!([{ "type": "text", "text": output }])
-            };
-            Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "content": content }
-            }))
-        }
-        Err(e) => {
-            Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{ "type": "text", "text": format!("Error: {}", e) }],
-                    "isError": true
-                }
-            }))
-        }
+        Ok(output) => Some(format_output(id, output)),
+        Err(e) => Some(format_error(id, e)),
     }
+}
+
+/// Format successful CLI output into MCP response
+fn format_output(id: Option<Value>, output: String) -> Value {
+    let content = if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
+        json!([{ "type": "text", "text": serde_json::to_string_pretty(&parsed).unwrap_or(output) }])
+    } else {
+        json!([{ "type": "text", "text": output }])
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "content": content }
+    })
+}
+
+/// Format error output into MCP response
+fn format_error(id: Option<Value>, error: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": format!("Error: {}", error) }],
+            "isError": true
+        }
+    })
 }
 
 /// Run the codeseek CLI binary and capture its stdout.
@@ -296,6 +542,42 @@ fn run_cli(args: &[&str]) -> Result<String, String> {
 /// in the current working directory. Silently skips files that don't exist
 /// or already contain the injection marker. All errors are logged via `log::warn!`
 /// but never block the MCP server startup.
+
+/// Setup SIGINT/SIGTERM signal handlers for graceful shutdown.
+/// This function runs in a separate task and signals shutdown when a signal is received.
+async fn setup_signal_handler(state: Arc<McpState>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("Failed to install SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("[mcp] SIGINT received");
+            }
+            _ = sigterm.recv() => {
+                info!("[mcp] SIGTERM received");
+            }
+        }
+
+        state.request_shutdown();
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows: use tokio::signal::ctrl_c
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!("[mcp] Failed to install Ctrl+C handler: {}", e);
+        } else {
+            info!("[mcp] Ctrl+C received");
+            state.request_shutdown();
+        }
+    }
+}
 fn maybe_inject_mcp_guidance() {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
