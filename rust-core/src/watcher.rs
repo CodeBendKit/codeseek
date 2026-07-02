@@ -29,7 +29,10 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
 ///
 /// The function returns a `FileWatcherGuard` that keeps the watcher alive.
 /// Dropping the guard stops the watcher.
-pub fn start_watcher(project_root: &Path) -> Result<FileWatcherGuard, String> {
+pub fn start_watcher(
+    project_root: &Path,
+    state: Option<std::sync::Arc<crate::mcp::server::McpState>>,
+) -> Result<FileWatcherGuard, String> {
     let root = project_root
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize project root: {}", e))?;
@@ -61,8 +64,9 @@ pub fn start_watcher(project_root: &Path) -> Result<FileWatcherGuard, String> {
 
     // Spawn the debounced event processor as a background tokio task
     let processor_root = root.clone();
+    let processor_state = state.clone();
     tokio::spawn(async move {
-        debounced_processor(event_rx, processor_root).await;
+        debounced_processor(event_rx, processor_root, processor_state).await;
     });
 
     info!("[watcher] File system watcher started for: {:?}", root);
@@ -163,6 +167,7 @@ fn should_watch_file(path: &Path, root: &Path) -> bool {
 async fn debounced_processor(
     mut event_rx: mpsc::UnboundedReceiver<Vec<PathBuf>>,
     root: PathBuf,
+    state: Option<std::sync::Arc<crate::mcp::server::McpState>>,
 ) {
     let mut pending_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut debounce_timer = tokio::time::sleep(DEBOUNCE_DURATION);
@@ -188,7 +193,7 @@ async fn debounced_processor(
                     None => {
                         // Channel closed — watcher has been dropped
                         if !pending_files.is_empty() {
-                            trigger_index_update(&root, &pending_files).await;
+                            trigger_index_update(&root, &pending_files, state.as_ref()).await;
                         }
                         info!("[watcher] Event channel closed, processor exiting");
                         break;
@@ -199,8 +204,16 @@ async fn debounced_processor(
             // Debounce timer fired — process accumulated changes
             _ = &mut debounce_timer, if timer_armed => {
                 timer_armed = false;
+                // 检查是否正在关闭
+                if let Some(ref state) = state {
+                    if state.is_shutdown_requested() {
+                        info!("[watcher] Shutdown requested, skipping index update");
+                        pending_files.clear();
+                        continue;
+                    }
+                }
                 if !pending_files.is_empty() {
-                    trigger_index_update(&root, &pending_files).await;
+                    trigger_index_update(&root, &pending_files, state.as_ref()).await;
                     pending_files.clear();
                 }
             }
@@ -209,12 +222,19 @@ async fn debounced_processor(
 }
 
 /// Trigger an incremental index update by spawning `codeseek init`.
-async fn trigger_index_update(root: &Path, files: &std::collections::HashSet<PathBuf>) {
+async fn trigger_index_update(
+    root: &Path,
+    files: &std::collections::HashSet<PathBuf>,
+    state: Option<&std::sync::Arc<crate::mcp::server::McpState>>,
+) {
     let file_count = files.len();
     info!(
         "[watcher] Triggering incremental index update for {} file(s)",
         file_count
     );
+
+    // 开始追踪操作
+    let _guard = state.as_ref().map(|s| s.begin_operation());
 
     // Use the same binary to run `codeseek init`
     let bin = match std::env::current_exe() {

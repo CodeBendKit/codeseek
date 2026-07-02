@@ -150,7 +150,7 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Phase 4: Start file watcher ────────────────────────────────
-    let _watcher_guard = match watcher::start_watcher(&project_root) {
+    let _watcher_guard = match watcher::start_watcher(&project_root, Some(state.clone())) {
         Ok(guard) => {
             info!("[mcp] File watcher started — index will auto-update on file changes");
             Some(guard)
@@ -514,9 +514,18 @@ fn run_cli(args: &[&str]) -> Result<String, String> {
     let bin = std::env::current_exe()
         .map_err(|e| format!("Failed to get binary path: {}", e))?;
 
-    // Ensure cwd is inherited from the MCP client (Claude Code's workspace)
-    let output = std::process::Command::new(&bin)
-        .args(args)
+    let mut command = std::process::Command::new(&bin);
+    command.args(args);
+
+    // Unix: 将子进程放入独立进程组，防止终端 SIGINT 传播到子进程
+    // 保护 LanceDB compact 操作不被中断
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -537,11 +546,6 @@ fn run_cli(args: &[&str]) -> Result<String, String> {
         }
     }
 }
-
-/// Attempts to inject CodeSeek MCP usage guidance into CLAUDE.md and AGENTS.md
-/// in the current working directory. Silently skips files that don't exist
-/// or already contain the injection marker. All errors are logged via `log::warn!`
-/// but never block the MCP server startup.
 
 /// Setup SIGINT/SIGTERM signal handlers for graceful shutdown.
 /// This function runs in a separate task and signals shutdown when a signal is received.
@@ -578,6 +582,10 @@ async fn setup_signal_handler(state: Arc<McpState>) {
         }
     }
 }
+/// Attempts to inject CodeSeek MCP usage guidance into CLAUDE.md and AGENTS.md
+/// in the current working directory. Silently skips files that don't exist
+/// or already contain the injection marker. All errors are logged via `log::warn!`
+/// but never block the MCP server startup.
 fn maybe_inject_mcp_guidance() {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
