@@ -2,7 +2,6 @@
 //! Reads from stdin, writes to stdout, delegates to CLI commands.
 //! Supports graceful shutdown with in-flight operation tracking.
 
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -16,6 +15,7 @@ use tracing::{info, warn};
 
 /// Marker for detecting already-injected guidance (idempotency guard)
 const INJECTION_MARKER_START: &str = "<!-- CODESEEK_INJECTION -->";
+#[cfg_attr(not(test), allow(dead_code))]
 /// Closing marker
 const INJECTION_MARKER_END: &str = "<!-- /CODESEEK_INJECTION -->";
 

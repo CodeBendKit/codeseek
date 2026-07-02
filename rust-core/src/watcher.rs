@@ -170,7 +170,7 @@ async fn debounced_processor(
     state: Option<std::sync::Arc<crate::mcp::server::McpState>>,
 ) {
     let mut pending_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut debounce_timer = tokio::time::sleep(DEBOUNCE_DURATION);
+    let debounce_timer = tokio::time::sleep(DEBOUNCE_DURATION);
     tokio::pin!(debounce_timer);
     let mut timer_armed = false;
 
