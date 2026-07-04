@@ -160,17 +160,17 @@ Source files
 
 ```
                         ┌─────────────────────┐
-User query ────────────→│  Embedding Model     │──→ Query vector
+User query ────────────→│  Embedding Model    │──→ Query vector
                         └─────────────────────┘
                                   │
           ┌───────────────────────┼───────────────────────┐
           ▼                       ▼                       ▼
-   ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
-   │ Dense Search │       │ Sparse Search│       │ Graph Search │
-   │ (LanceDB ANN)│       │ (Tantivy BM25)│      │ (PetCodeGraph)│
-   └──────┬───────┘       └──────┬──────┘       └──────┬──────┘
-          │                      │                      │
-          └──────────────────────┼──────────────────────┘
+   ┌──────────────┐      ┌───────────────┐       ┌───────────────┐
+   │ Dense Search │      │ Sparse Search │       │ Graph Search  │
+   │ (LanceDB ANN)│      │ (Tantivy BM25)│       │ (PetCodeGraph)│
+   └──────┬───────┘      └──────┬────────┘       └────────┬──────┘
+          │                      │                        │
+          └──────────────────────┼────────────────────────┘
                                  ▼
                         ┌─────────────────┐
                         │   RRF Fusion    │  ← Reciprocal Rank Fusion
