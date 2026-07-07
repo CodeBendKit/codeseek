@@ -11,6 +11,7 @@ use tracing::{info, warn};
 /// Marker for detecting already-injected guidance (idempotency guard)
 const INJECTION_MARKER_START: &str = "<!-- CODESEEK_INJECTION -->";
 /// Closing marker
+#[allow(dead_code)]
 const INJECTION_MARKER_END: &str = "<!-- /CODESEEK_INJECTION -->";
 
 /// The guidance content to inject
