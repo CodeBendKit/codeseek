@@ -205,4 +205,32 @@ function something() {
         let report = analyze_js_code(code);
         assert_eq!(report.code_type, CodeType::CompiledCode);
     }
+
+    #[test]
+    fn test_webpack_bundle_detection() {
+        // Use the real webpack bundle file from test fixtures
+        let code = include_str!("../../tests/test_repos/simple_js_project/main.9d1c33d4.js");
+        let report = analyze_js_code(code);
+
+        // This file is a webpack-bundled, minified React production build.
+        // It should be detected as CompiledCode (not indexed).
+        assert_eq!(
+            report.code_type,
+            CodeType::CompiledCode,
+            "Expected webpack bundle to be detected as CompiledCode, but got {:?}: {}",
+            report.code_type,
+            report.reason
+        );
+
+        // Verify the detection reason mentions a fingerprint match
+        let has_fingerprint = report.reason.contains("fingerprint")
+            || report.reason.contains("compiler")
+            || report.reason.contains("obfuscat");
+        let has_density = report.reason.contains("density");
+        assert!(
+            has_fingerprint || has_density,
+            "Detection reason should mention fingerprint or density, got: {}",
+            report.reason
+        );
+    }
 }
