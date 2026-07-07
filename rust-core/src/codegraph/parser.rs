@@ -738,7 +738,7 @@ impl CodeParser {
                 continue;
             }
             
-            // 跳过混淆的 JavaScript 文件
+            // Skip obfuscated JavaScript files
             if self.is_obfuscated_js_file(&file_path)? {
                 info!("Skipping obfuscated JS file: {}", file_path.display());
                 skipped_files += 1;
