@@ -403,6 +403,14 @@ impl EmbeddingService {
                 }
             }
 
+            // ── 混淆 JS 文件过滤：避免将混淆代码索引到向量库中 ──
+            if file_path.extension().map(|e| e == "js" || e == "jsx").unwrap_or(false) {
+                if crate::detector::analyze_js_code(&content).code_type == crate::detector::CodeType::CompiledCode {
+                    info!("Skipping obfuscated JS file: {}", file_path.display());
+                    continue;
+                }
+            }
+
             match self.process_file_content(&file_path, &content, &mut ts_parser).await {
                 Ok(vectors) => {
                     total_vectors += vectors;
