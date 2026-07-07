@@ -32,6 +32,10 @@ impl CodeSeekRunner {
                 info!("callees command - to be implemented in Phase 2");
                 Ok(())
             }
+            Commands::Callgraph { symbol: _, depth: _, json: _ } => {
+                info!("callgraph command - to be implemented in Phase 2");
+                Ok(())
+            }
             Commands::Uninit { force: _ } => {
                 info!("uninit command - to be implemented in Phase 2");
                 Ok(())

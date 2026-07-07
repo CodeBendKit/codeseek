@@ -11,6 +11,7 @@ use tracing::{info, warn};
 /// Marker for detecting already-injected guidance (idempotency guard)
 const INJECTION_MARKER_START: &str = "<!-- CODESEEK_INJECTION -->";
 /// Closing marker
+#[allow(dead_code)]
 const INJECTION_MARKER_END: &str = "<!-- /CODESEEK_INJECTION -->";
 
 /// The guidance content to inject
@@ -22,11 +23,12 @@ Before any Grep/Glob/Bash for code search, try CodeSeek tools first.\n\
 They give you AST-verified definitions with signatures and line numbers.\n\
 \n\
 Tool priority (use in this order):\n\
-1. codeseek_search(\"query\") — FIRST for finding code by name or behavior\n\
-2. codeseek_callers(\"fn\")   — REQUIRED before modifying any function\n\
-3. codeseek_callees(\"fn\")   — to understand internal dependencies\n\
-4. Grep — ONLY for exact strings (error messages, UUIDs, log formats)\n\
-5. Glob — ONLY when you already know the exact filename pattern\n\
+1. codeseek_search(\"query\")      — FIRST for finding code by name or behavior\n\
+2. codeseek_callers(\"fn\")        — REQUIRED before modifying any function\n\
+3. codeseek_callees(\"fn\")        — to understand internal dependencies\n\
+4. codeseek_callgraph(\"fn\", 2)   — to explore full calling context with depth\n\
+5. Grep — ONLY for exact strings (error messages, UUIDs, log formats)\n\
+6. Glob — ONLY when you already know the exact filename pattern\n\
 <!-- /CODESEEK_INJECTION -->\n";
 
 /// Target filenames for injection
@@ -189,7 +191,7 @@ fn handle_initialize(id: Option<Value>) -> Option<Value> {
                 "name": "codeseek",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Automatically indexes your project on startup and watches for file changes in real-time.\n\nTools:\n- codeseek_search — find symbols by name\n- codeseek_callers — who calls this function?\n- codeseek_callees — what does this function call?\n- codeseek_init — manually trigger re-index\n- codeseek_status — check index health\n- codeseek_list — list indexed projects"
+            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Automatically indexes your project on startup and watches for file changes in real-time.\n\nTools:\n- codeseek_search — find symbols by name\n- codeseek_callers — who calls this function?\n- codeseek_callees — what does this function call?\n- codeseek_callgraph — query call graph with depth (bi-directional)\n- codeseek_init — manually trigger re-index\n- codeseek_status — check index health\n- codeseek_list — list indexed projects"
         }
     }))
 }
@@ -224,6 +226,15 @@ fn handle_tools_call(id: Option<Value>, request: &Value) -> Option<Value> {
         "codeseek_callees" => {
             let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
             run_cli(&["callees", symbol, "--json"])
+        }
+        "codeseek_callgraph" => {
+            let symbol = arguments.get("function_name").and_then(|v| v.as_str()).unwrap_or("");
+            let depth = arguments.get("depth").and_then(|v| v.as_u64()).unwrap_or(1);
+            if symbol.is_empty() {
+                Err("Missing required argument: function_name".to_string())
+            } else {
+                run_cli(&["callgraph", symbol, "--depth", &depth.to_string(), "--json"])
+            }
         }
         "codeseek_init" => {
             run_cli(&["init"])

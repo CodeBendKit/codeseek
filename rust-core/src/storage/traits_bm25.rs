@@ -76,14 +76,23 @@ pub struct TextSearchResult {
     pub line_start: usize,
 }
 
+/// 序列化辅助：保留3位小数的 f64
+fn round_3_f64<S>(x: &f64, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let val = (x * 1000.0).round() / 1000.0;
+    s.serialize_f64(val)
+}
+
 /// 混合搜索的最终融合结果
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FusedCandidate {
     pub snippet_id: String,
+    #[serde(serialize_with = "round_3_f64")]
     pub final_score: f64,
     pub file_path: String,
     pub symbol_name: String,
-    pub symbol_type: String,
     pub language: String,
     pub line_start: usize,
     pub line_end: usize,

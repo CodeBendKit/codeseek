@@ -363,6 +363,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Callgraph { symbol, depth, json } => {
+            let project_root = detect_project()?;
+            let (_, lock_path) = project_paths(&project_root);
+            let _lock = FileLock::shared(lock_path)?;
+            let project_hash = Config::compute_project_hash(&project_root);
+            let storage = Arc::new(StorageManager::new());
+            match storage.get_persistence().load_graph(&project_hash) {
+                Ok(Some(graph)) => {
+                    let results = execute_callgraph(&graph, symbol, *depth, *json)?;
+                    if !*json && results.trim().is_empty() {
+                        println!("No function found for '{}'", symbol);
+                    } else {
+                        print!("{}", results);
+                    }
+                }
+                _ => {
+                    println!("No index found. Run 'codeseek init' first.");
+                }
+            }
+        }
         Commands::Uninit { force } => {
             let project_root = detect_project()?;
             let (index_dir, lock_path) = project_paths(&project_root);
@@ -592,6 +612,16 @@ fn execute_callees(
     }
 
     Ok(output)
+}
+
+// Callgraph query function delegated to services module
+fn execute_callgraph(
+    graph: &PetCodeGraph,
+    symbol: &str,
+    depth: u32,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    codeseek::services::execute_callgraph(graph, symbol, depth, json)
 }
 
 // ── MCP Install / Uninstall helpers ────────────────────────────────────

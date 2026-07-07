@@ -69,6 +69,17 @@ pub enum Commands {
         #[clap(long, action)]
         json: bool,
     },
+    /// Query function call graph with depth (bi-directional)
+    Callgraph {
+        /// Function name to query as center node
+        symbol: String,
+        /// Query depth — layers of callers and callees to include (1-3)
+        #[arg(short = 'd', long = "depth", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=3))]
+        depth: u32,
+        /// Output as JSON
+        #[clap(long, action)]
+        json: bool,
+    },
     /// Delete the current project's index data
     Uninit {
         /// Skip confirmation prompt

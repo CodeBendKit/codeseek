@@ -48,6 +48,21 @@ Natural Language Code Search example
 
 ```
 
+Function Call Graph example
+
+```bash
+╰─$ codeseek callgraph apply_rerank
+Call graph for 'apply_rerank' (depth=1):
+
+== Callers (upstream, depth=1) ==
+  search (/home/do/ssd/iohub/dev/codeseek/rust-core/src/services/hybrid_search.rs:210)
+
+== Callees (downstream, depth=1) ==
+  rerank (/home/do/ssd/iohub/dev/codeseek/rust-core/src/services/reranker_service.rs:331)
+  config (/home/do/ssd/iohub/dev/codeseek/rust-core/src/services/hybrid_search.rs:325)
+
+```
+
 ## Install
 
 ### npm
@@ -102,6 +117,7 @@ cd codeseek
 | `codeseek search <query>` | Symbol name search (falls back from vector → graph name match) |
 | `codeseek callers <symbol>` | Find functions that call this symbol |
 | `codeseek callees <symbol>` | Find functions this symbol calls |
+| `codeseek callgraph <symbol>` | Query call graph with configurable depth (bi-directional) |
 | `codeseek list` | List all indexed projects with paths |
 | `codeseek install` | Register codeseek as MCP tools in Claude Code / Codex |
 | `codeseek uninstall` | Remove MCP integration |
@@ -131,6 +147,7 @@ Claude Code auto-discovers these tools after restart:
 | `codeseek_search` | Find symbols by name |
 | `codeseek_callers` | Trace upstream callers |
 | `codeseek_callees` | Trace downstream callees |
+| `codeseek_callgraph` | Query call graph with configurable depth (bi-directional) |
 | `codeseek_status` | Check index health |
 
 Remove integration:

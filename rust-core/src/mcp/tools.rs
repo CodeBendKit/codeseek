@@ -60,6 +60,27 @@ pub fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "codeseek_callgraph".into(),
+            description: "Query function call graph with configurable depth. Shows both callers (upstream) and callees (downstream) around a center function. Depth controls how many layers of callers/callees to include (max 3). Use this to understand the full calling context of a function.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "function_name": {
+                        "type": "string",
+                        "description": "Name of the function to query as the center of the call graph"
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Query depth — layers of callers and callees to include (1-3, default: 1)",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 3
+                    }
+                },
+                "required": ["function_name"]
+            }),
+        },
+        Tool {
             name: "codeseek_init".into(),
             description: "Build or update the code index for the current project. Run this first before using other codeseek tools. Idempotent — subsequent runs only re-process changed files.".into(),
             input_schema: serde_json::json!({

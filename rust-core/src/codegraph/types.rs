@@ -163,6 +163,13 @@ impl PetCodeGraph {
         let callee_node = self.function_to_node.get(&relation.callee_id)
             .ok_or_else(|| format!("Callee function {} not found", relation.callee_id))?;
 
+        // 检查是否已有相同边（相同 caller, callee, line_number）
+        let is_duplicate = self.graph.edges_directed(*caller_node, Direction::Outgoing)
+            .any(|e| e.target() == *callee_node && e.weight().line_number == relation.line_number);
+        if is_duplicate {
+            return Ok(());  // 跳过重复边
+        }
+
         // 添加到petgraph
         self.graph.add_edge(*caller_node, *callee_node, relation.clone());
         
@@ -195,12 +202,17 @@ impl PetCodeGraph {
     /// 获取函数的调用者
     pub fn get_callers(&self, function_id: &Uuid) -> Vec<(&FunctionInfo, &CallRelation)> {
         let mut callers = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         if let Some(&node_index) = self.function_to_node.get(function_id) {
             for edge in self.graph.edges_directed(node_index, Direction::Incoming) {
                 let caller_node = edge.source();
                 let caller_function = self.graph.node_weight(caller_node).unwrap();
                 let relation = edge.weight();
-                callers.push((caller_function, relation));
+                // Dedup by (caller_id, callee_id, line_number)
+                let key = (relation.caller_id, relation.callee_id, relation.line_number);
+                if seen.insert(key) {
+                    callers.push((caller_function, relation));
+                }
             }
         }
         callers
@@ -209,12 +221,17 @@ impl PetCodeGraph {
     /// 获取函数调用的函数
     pub fn get_callees(&self, function_id: &Uuid) -> Vec<(&FunctionInfo, &CallRelation)> {
         let mut callees = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         if let Some(&node_index) = self.function_to_node.get(function_id) {
             for edge in self.graph.edges_directed(node_index, Direction::Outgoing) {
                 let callee_node = edge.target();
                 let callee_function = self.graph.node_weight(callee_node).unwrap();
                 let relation = edge.weight();
-                callees.push((callee_function, relation));
+                // Dedup by (caller_id, callee_id, line_number)
+                let key = (relation.caller_id, relation.callee_id, relation.line_number);
+                if seen.insert(key) {
+                    callees.push((callee_function, relation));
+                }
             }
         }
         callees
