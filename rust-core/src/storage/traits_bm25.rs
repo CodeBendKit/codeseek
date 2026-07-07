@@ -93,6 +93,7 @@ pub struct FusedCandidate {
     pub final_score: f64,
     pub file_path: String,
     pub symbol_name: String,
+    pub language: String,
     pub line_start: usize,
     pub line_end: usize,
     pub code_block: String,
