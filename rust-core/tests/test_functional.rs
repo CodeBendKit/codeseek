@@ -45,6 +45,13 @@ fn test_build_graph_for_project(_storage: &Arc<StorageManager>, project_path: &s
     
     let code_graph = code_graph.unwrap();
     
+    // 调试：输出函数数量
+    println!("  [DEBUG] code_graph.functions count: {}", code_graph.functions.len());
+    for (id, func) in &code_graph.functions {
+        println!("  [DEBUG]   Function: {} ({}) - {:?}", id, func.name, func.language);
+    }
+    println!("  [DEBUG] code_graph.call_relations count: {}", code_graph.call_relations.len());
+    
     // 验证代码图包含函数
     assert!(!code_graph.functions.is_empty(), "Code graph should contain functions");
     
