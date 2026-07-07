@@ -48,13 +48,13 @@ impl RepositoryManager {
     pub fn initialize(&mut self) -> Result<(), String> {
         info!("Initializing repository analysis for: {}", self.repository_path.display());
 
-        // 扫描所有文件
+        // Scan all files
         let files = self.parser.scan_directory(&self.repository_path);
         info!("Found {} files to analyze", files.len());
 
-        // 分析每个文件（跳过混淆的 JS 文件）
+        // Analyze each file (skip obfuscated JS files)
         for file_path in files {
-            // 检查是否为混淆的 JS 文件
+            // Check if this is an obfuscated JS file
             let is_obfuscated = file_path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -66,7 +66,7 @@ impl RepositoryManager {
                             let report = detector::analyze_js_code(&content);
                             report.code_type == detector::CodeType::CompiledCode
                         }
-                        Err(_) => false, // 读取失败则继续处理（由 refresh_file 报错）
+                        Err(_) => false, // If read fails, let refresh_file report the error
                     }
                 };
 

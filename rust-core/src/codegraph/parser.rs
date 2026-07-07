@@ -37,10 +37,10 @@ impl CodeParser {
         }
     }
 
-    /// 检查 JS 文件是否为混淆/编译代码。
-    /// 非 JS 文件直接返回 Ok(false)。
+    /// Check whether a JS file is obfuscated/compiled code.
+    /// Non-JS files directly return Ok(false).
     pub fn is_obfuscated_js_file(&self, file_path: &Path) -> Result<bool, String> {
-        // 仅检查 JS/JSX 文件
+        // Only check JS/JSX files
         let is_js = file_path
             .extension()
             .and_then(|e| e.to_str())
