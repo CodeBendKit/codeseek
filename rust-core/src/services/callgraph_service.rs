@@ -91,6 +91,12 @@ pub fn collect_callers_json(
 
     let mut results = vec![];
     for (caller, relation) in graph.get_callers(function_id) {
+        // Skip already visited functions (prevents duplicates and cycles)
+        if visited.contains(&caller.id) {
+            continue;
+        }
+        visited.insert(caller.id);
+
         let mut node = serde_json::json!({
             "name": caller.name,
             "file_path": caller.file_path,
@@ -100,10 +106,8 @@ pub fn collect_callers_json(
             "call_line": relation.line_number,
         });
 
-        if depth > 1 && !visited.contains(&caller.id) {
-            visited.insert(caller.id);
+        if depth > 1 {
             let sub_callers = collect_callers_json(graph, &caller.id, depth - 1, visited);
-            visited.remove(&caller.id);
             node["callers"] = serde_json::Value::Array(sub_callers);
         } else {
             node["callers"] = serde_json::Value::Array(vec![]);
@@ -128,6 +132,12 @@ pub fn collect_callees_json(
 
     let mut results = vec![];
     for (callee, relation) in graph.get_callees(function_id) {
+        // Skip already visited functions (prevents duplicates and cycles)
+        if visited.contains(&callee.id) {
+            continue;
+        }
+        visited.insert(callee.id);
+
         let mut node = serde_json::json!({
             "name": callee.name,
             "file_path": callee.file_path,
@@ -137,10 +147,8 @@ pub fn collect_callees_json(
             "call_line": relation.line_number,
         });
 
-        if depth > 1 && !visited.contains(&callee.id) {
-            visited.insert(callee.id);
+        if depth > 1 {
             let sub_callees = collect_callees_json(graph, &callee.id, depth - 1, visited);
-            visited.remove(&callee.id);
             node["callees"] = serde_json::Value::Array(sub_callees);
         } else {
             node["callees"] = serde_json::Value::Array(vec![]);
