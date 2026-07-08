@@ -102,6 +102,26 @@ pub enum Commands {
     Install,
     /// Remove codeseek MCP integration from Claude Code / Codex
     Uninstall,
+    /// Show the code skeleton (function signatures without implementation) for one or more files
+    Skeleton {
+        /// File paths to show skeletons for (absolute or relative to project root)
+        #[arg(required = true)]
+        file_paths: Vec<String>,
+        /// Output as JSON
+        #[clap(long, action)]
+        json: bool,
+    },
+    /// Show the code snippet for a specific function
+    Snippet {
+        /// Function name to look up
+        function_name: String,
+        /// File path to disambiguate if multiple functions share the same name
+        #[arg(short, long = "file-path")]
+        file_path: Option<String>,
+        /// Output as JSON
+        #[clap(long, action)]
+        json: bool,
+    },
     /// Install git hooks (post-commit, post-merge → codeseek init)
     InstallHooks,
 }

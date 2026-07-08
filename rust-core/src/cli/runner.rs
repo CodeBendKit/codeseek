@@ -56,6 +56,14 @@ impl CodeSeekRunner {
                 info!("uninstall command - please use codeseek directly");
                 Ok(())
             }
+            Commands::Skeleton { file_paths: _, json: _ } => {
+                info!("skeleton command - to be implemented in Phase 2");
+                Ok(())
+            }
+            Commands::Snippet { function_name: _, file_path: _, json: _ } => {
+                info!("snippet command - to be implemented in Phase 2");
+                Ok(())
+            }
             Commands::InstallHooks => {
                 info!("install-hooks command - please use codeseek directly");
                 Ok(())

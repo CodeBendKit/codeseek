@@ -27,8 +27,10 @@ Tool priority (use in this order):\n\
 2. codeseek_callers(\"fn\")        — REQUIRED before modifying any function\n\
 3. codeseek_callees(\"fn\")        — to understand internal dependencies\n\
 4. codeseek_callgraph(\"fn\", 2)   — to explore full calling context with depth\n\
-5. Grep — ONLY for exact strings (error messages, UUIDs, log formats)\n\
-6. Glob — ONLY when you already know the exact filename pattern\n\
+5. codeseek_skeleton(\"filepaths\") — to explore file structure before reading full files\n\
+6. codeseek_snippet(\"fn\", \"filepath\") — to read exact function implementation\n\
+7. Grep — ONLY for exact strings (error messages, UUIDs, log formats)\n\
+8. Glob — ONLY when you already know the exact filename pattern\n\
 <!-- /CODESEEK_INJECTION -->\n";
 
 /// Target filenames for injection
@@ -191,7 +193,7 @@ fn handle_initialize(id: Option<Value>) -> Option<Value> {
                 "name": "codeseek",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Automatically indexes your project on startup and watches for file changes in real-time.\n\nTools:\n- codeseek_search — find symbols by name\n- codeseek_callers — who calls this function?\n- codeseek_callees — what does this function call?\n- codeseek_callgraph — query call graph with depth (bi-directional)\n- codeseek_init — manually trigger re-index\n- codeseek_status — check index health\n- codeseek_list — list indexed projects"
+            "instructions": "Code intelligence CLI — AST-based call graph + semantic search. Automatically indexes your project on startup and watches for file changes in real-time.\n\nTools:\n- codeseek_search — find symbols by name\n- codeseek_callers — who calls this function?\n- codeseek_callees — what does this function call?\n- codeseek_callgraph — query call graph with depth (bi-directional)\n- codeseek_skeleton — show function signatures for files\n- codeseek_snippet — show full source code of a function\n- codeseek_init — manually trigger re-index\n- codeseek_status — check index health\n- codeseek_list — list indexed projects"
         }
     }))
 }
@@ -244,6 +246,69 @@ fn handle_tools_call(id: Option<Value>, request: &Value) -> Option<Value> {
         }
         "codeseek_status" => {
             run_cli(&["status", "--json"])
+        }
+        "codeseek_skeleton" => {
+            let file_paths = match arguments.get("file_paths") {
+                Some(Value::Array(arr)) => {
+                    let paths: Vec<String> = arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    if paths.is_empty() {
+                        return Some(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": "Error: 'file_paths' must be a non-empty array of strings" }],
+                                "isError": true
+                            }
+                        }));
+                    }
+                    paths
+                }
+                _ => {
+                    return Some(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": "Error: Missing required argument 'file_paths'" }],
+                            "isError": true
+                        }
+                    }));
+                }
+            };
+
+            // Build CLI args: skeleton <file1> <file2> ... --json
+            let mut cli_args: Vec<String> = vec!["skeleton".to_string()];
+            cli_args.extend(file_paths);
+            cli_args.push("--json".to_string());
+            let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+            run_cli(&args_refs)
+        }
+        "codeseek_snippet" => {
+            let function_name = match arguments.get("function_name").and_then(|v| v.as_str()) {
+                Some(name) => name,
+                None => {
+                    return Some(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": "Error: Missing required argument 'function_name'" }],
+                            "isError": true
+                        }
+                    }));
+                }
+            };
+            let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+
+            // Build CLI args: snippet <function_name> [--file-path <path>] --json
+            let mut cli_args: Vec<String> = vec![
+                "snippet".to_string(),
+                function_name.to_string(),
+            ];
+            if let Some(fp) = file_path {
+                cli_args.push("--file-path".to_string());
+                cli_args.push(fp.to_string());
+            }
+            cli_args.push("--json".to_string());
+            let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+            run_cli(&args_refs)
         }
         _ => Err(format!("Unknown tool: {}", tool_name)),
     };

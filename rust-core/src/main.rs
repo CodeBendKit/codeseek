@@ -3,17 +3,25 @@ use codeseek::cli::args::{Cli, Commands};
 use codeseek::config::Config;
 use codeseek::storage::lock::FileLock;
 use codeseek::storage::StorageManager;
-use codeseek::codegraph::types::PetCodeGraph;
+use codeseek::codegraph::types::{PetCodeGraph, FunctionInfo};
 use codeseek::services::CodeAnalyzer;
 use codeseek::services::EmbeddingService;
 use codeseek::services::hybrid_search::{HybridSearchService, HybridSearchConfig};
 use codeseek::storage::TantivyBm25Index;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
 use codeseek::ui::progress::ProgressBar;
 use codeseek::mcp;
+use uuid::Uuid;
+
+// Treesitter AST skeletonizer imports
+use codeseek::codegraph::treesitter::structs::SymbolType;
+use codeseek::codegraph::treesitter::ast_instance_structs::SymbolInformation;
+use codeseek::codegraph::treesitter::make_formatter;
+use codeseek::codegraph::treesitter::parsers::get_ast_parser_by_filename;
 
 /// 从当前工作目录检测项目根（向上找 .git/）
 fn detect_project() -> Result<PathBuf, String> {
@@ -475,6 +483,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uninstall_from_claude()?;
             uninstall_from_codex()?;
         }
+        Commands::Skeleton { file_paths, json } => {
+            match execute_skeleton(file_paths, *json) {
+                Ok(output) => print!("{}", output),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Snippet { function_name, file_path, json } => {
+            match execute_snippet(function_name, file_path.as_deref(), *json) {
+                Ok(output) => print!("{}", output),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::InstallHooks => {
             let project_root = detect_project()?;
             let git_dir = project_root.join(".git");
@@ -804,4 +830,260 @@ fn uninstall_from_codex() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// 判断符号类型是否应该作为顶层骨架条目显示
+fn is_skeleton_worthy(symbol_type: &SymbolType) -> bool {
+    matches!(
+        symbol_type,
+        SymbolType::StructDeclaration
+            | SymbolType::FunctionDeclaration
+            | SymbolType::TypeAlias
+            | SymbolType::Module
+    )
+}
+
+/// 对单个文件使用 AST 解析和 SkeletonFormatter 生成代码骨架
+fn generate_skeleton_for_file(file_path_str: &str) -> Result<String, String> {
+    let file_path = PathBuf::from(file_path_str);
+
+    // 1. 验证文件存在
+    if !file_path.exists() {
+        return Err(format!("File not found: {}", file_path_str));
+    }
+
+    // 2. 读取源代码
+    let code = std::fs::read_to_string(&file_path)
+        .map_err(|e| format!("Cannot read file {}: {}", file_path_str, e))?;
+
+    // 3. 获取语言特定 AST 解析器
+    let (mut parser, language_id) = get_ast_parser_by_filename(&file_path)
+        .map_err(|e| format!("Skeleton not supported for {}: {}", file_path_str, e))?;
+
+    // 4. 解析文件
+    let symbols = parser.parse(&code, &file_path);
+    if symbols.is_empty() {
+        return Ok(format!("// No symbols found in {}", file_path_str));
+    }
+
+    // 5. 构建 SymbolInformation 列表和 guid_to_children 映射
+    let mut symbols_info: Vec<SymbolInformation> = Vec::with_capacity(symbols.len());
+    let mut guid_to_children: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+
+    for s in &symbols {
+        let guard = s.read();
+        let info = guard.symbol_info_struct();
+        let guid = guard.guid().clone();
+        let children = guard.childs_guid().clone();
+        guid_to_children.insert(guid, children);
+        symbols_info.push(info);
+    }
+
+    // 6. 构建 guid_to_info 引用映射
+    let guid_to_info: HashMap<Uuid, &SymbolInformation> = symbols_info
+        .iter()
+        .map(|s| (s.guid.clone(), s))
+        .collect();
+
+    // 7. 识别顶层符号（其 GUID 不是任何其他符号的子节点）
+    let all_children_guids: HashSet<Uuid> = guid_to_children
+        .values()
+        .flat_map(|children| children.iter())
+        .cloned()
+        .collect();
+
+    let mut top_level_symbols: Vec<&SymbolInformation> = symbols_info
+        .iter()
+        .filter(|s| !all_children_guids.contains(&s.guid))
+        .filter(|s| is_skeleton_worthy(&s.symbol_type))
+        .collect();
+
+    // 按行号排序，保持稳定的输出顺序
+    top_level_symbols.sort_by_key(|s| s.full_range.start_point.row);
+
+    if top_level_symbols.is_empty() {
+        return Ok(format!("// No structural symbols found in {}", file_path_str));
+    }
+
+    // 8. 对每个顶层符号生成骨架
+    let formatter = make_formatter(&language_id);
+    let skeleton_parts: Vec<String> = top_level_symbols
+        .iter()
+        .map(|symbol| formatter.make_skeleton(symbol, &code, &guid_to_children, &guid_to_info))
+        .collect();
+
+    Ok(skeleton_parts.join("\n\n"))
+}
+
+// ── Skeleton command ──────────────────────────────────────────────────
+fn execute_skeleton(
+    file_paths: &[String],
+    _json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut all_skeletons: Vec<serde_json::Value> = Vec::new();
+
+    for file_path_str in file_paths {
+        let input_path = PathBuf::from(file_path_str);
+        let language = detect_language(&input_path);
+        
+        let skeleton_text = match generate_skeleton_for_file(file_path_str) {
+            Ok(text) => text,
+            Err(e) => format!("// Error: {}", e),
+        };
+
+        all_skeletons.push(serde_json::json!({
+            "filepath": file_path_str,
+            "language": language,
+            "skeleton_text": skeleton_text,
+        }));
+    }
+
+    let result = serde_json::json!({
+        "success": true,
+        "data": {
+            "skeletons": all_skeletons
+        }
+    });
+
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+// ── Snippet command ──────────────────────────────────────────────────
+fn execute_snippet(
+    function_name: &str,
+    file_path: Option<&str>,
+    _json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let project_root = detect_project()?;
+    let (_index_dir, lock_path) = project_paths(&project_root);
+    let _lock = FileLock::shared(lock_path)?;
+
+    let project_hash = Config::compute_project_hash(&project_root);
+    let storage = Arc::new(StorageManager::new());
+
+    let graph = match storage.get_persistence().load_graph(&project_hash) {
+        Ok(Some(g)) => g,
+        _ => {
+            let result = serde_json::json!({
+                "success": false,
+                "error": "No index found. Run 'codeseek init' first."
+            });
+            return Ok(serde_json::to_string_pretty(&result)?);
+        }
+    };
+
+    // Find functions by name
+    let mut candidates: Vec<&FunctionInfo> = graph.find_functions_by_name(function_name);
+
+    // Filter by file path if provided
+    if let Some(fp) = file_path {
+        let fp_path = PathBuf::from(fp);
+        candidates.retain(|f| {
+            f.file_path == fp_path
+                || f.file_path.ends_with(&fp_path)
+                || fp_path.ends_with(&f.file_path)
+        });
+    }
+
+    if candidates.is_empty() {
+        let result = serde_json::json!({
+            "success": false,
+            "error": format!("Function '{}' not found{}", function_name,
+                file_path.map(|fp| format!(" in file '{}'", fp)).unwrap_or_default())
+        });
+        return Ok(serde_json::to_string_pretty(&result)?);
+    }
+
+    if candidates.len() > 1 && file_path.is_none() {
+        let locations: Vec<String> = candidates.iter()
+            .map(|f| format!("  {}:{} (line {})", f.file_path.display(), f.name, f.line_start))
+            .collect();
+        let result = serde_json::json!({
+            "success": false,
+            "error": format!("Multiple functions named '{}' found. Specify --file-path to disambiguate:\n{}",
+                function_name, locations.join("\n"))
+        });
+        return Ok(serde_json::to_string_pretty(&result)?);
+    }
+
+    let func = candidates[0];
+
+    // Resolve source file path on disk
+    let source_path = resolve_source_path(&func.file_path, &project_root);
+
+    // Read snippet from file
+    let code_snippet = read_line_range(&source_path, func.line_start, func.line_end)
+        .map_err(|e| format!("Failed to read function source: {}", e))?;
+
+    let language = detect_language(&func.file_path);
+
+    let result = serde_json::json!({
+        "success": true,
+        "data": {
+            "filepath": func.file_path.to_string_lossy(),
+            "function_name": func.name,
+            "code_snippet": code_snippet,
+            "line_start": func.line_start,
+            "line_end": func.line_end,
+            "language": language
+        }
+    });
+
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+// ── Utility functions ────────────────────────────────────────────────
+
+/// Resolve the actual file path on disk from a FunctionInfo's file_path.
+fn resolve_source_path(file_path: &Path, root: &Path) -> PathBuf {
+    if file_path.is_absolute() && file_path.exists() {
+        file_path.to_path_buf()
+    } else {
+        let rooted = root.join(file_path);
+        if rooted.exists() {
+            rooted
+        } else {
+            file_path.to_path_buf()
+        }
+    }
+}
+
+/// Detect programming language from file extension.
+fn detect_language(path: &Path) -> String {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "rs" => "rust",
+        "go" => "go",
+        "py" | "pyw" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "jsx" => "jsx",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+        "cs" => "csharp",
+        "rb" => "ruby",
+        "swift" => "swift",
+        "php" => "php",
+        "lua" => "lua",
+        "zig" => "zig",
+        _ => "unknown",
+    }.to_string()
+}
+
+/// Read a line range [start, end] (1-indexed, inclusive) from a file.
+fn read_line_range(file_path: &Path, line_start: usize, line_end: usize) -> Result<String, String> {
+    let content = std::fs::read_to_string(file_path)
+        .map_err(|e| format!("Failed to read file {}: {}", file_path.display(), e))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = line_start.saturating_sub(1); // Convert to 0-indexed
+    let end_idx = line_end.min(lines.len());
+    if start_idx >= lines.len() {
+        return Err(format!(
+            "Line range [{}, {}] out of bounds (file has {} lines)",
+            line_start, line_end, lines.len()
+        ));
+    }
+    Ok(lines[start_idx..end_idx].join("\n"))
 }

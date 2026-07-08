@@ -104,5 +104,38 @@ pub fn all_tools() -> Vec<Tool> {
                 "properties": {}
             }),
         },
+        Tool {
+            name: "codeseek_skeleton".into(),
+            description: "Show the code skeleton (function signatures without implementation) for one or more files. Returns function signatures organized by file — useful for understanding file structure without reading full source code.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "List of file paths to show skeletons for (absolute or relative to project root)"
+                    }
+                },
+                "required": ["file_paths"]
+            }),
+        },
+        Tool {
+            name: "codeseek_snippet".into(),
+            description: "Show the full source code of a specific function. Returns function body including signature, parameters, and implementation.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "function_name": {
+                        "type": "string",
+                        "description": "Name of the function to look up"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "File path to disambiguate if multiple functions share the same name (optional)"
+                    }
+                },
+                "required": ["function_name"]
+            }),
+        },
     ]
 }
