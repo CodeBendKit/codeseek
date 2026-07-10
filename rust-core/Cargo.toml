@@ -14,7 +14,7 @@ clap = { version = "4.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
-chrono = { version = "=0.4.38", features = ["serde"] }
+chrono = { version = "=0.4.44", features = ["serde"] }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
@@ -47,8 +47,8 @@ similar = "2.3"
 typetag = "0.2"
 
 
-lancedb = "=0.4.15"
-arrow = "50"
+lancedb = "=0.31.0"
+arrow = "58"
 reqwest = { version = "0.13.1", features = ["json"] }
 futures = "0.3.31"
 toml = "0.8"
@@ -56,7 +56,7 @@ dirs = "5.0"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 anyhow = "1"
 
-lance = "=0.10.6"
+lance = "=8.0.0"
 
 # BM25 full-text search
 tantivy = "0.22"

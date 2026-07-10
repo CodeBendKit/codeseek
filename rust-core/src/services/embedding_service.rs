@@ -24,7 +24,7 @@ use crate::config::Config;
 use crate::storage::traits_bm25::{TextSearchProvider, CodeChunk};
 
 use lancedb::table::OptimizeAction;
-use lance::dataset::optimize::CompactionOptions;
+use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::TimeDelta;
 
@@ -770,8 +770,9 @@ impl EmbeddingService {
         let table = self.connection.open_table(&self.table_name).execute().await?;
         
         let batches = vec![Ok(batch)];
-        let batch_iter = RecordBatchIterator::new(batches, schema.clone());
-        table.add(batch_iter).execute().await?;
+        let data: Box<dyn arrow::array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(batches, schema));
+        table.add(data).execute().await?;
 
         Ok(())
     }
@@ -793,12 +794,23 @@ impl EmbeddingService {
 
         // ── Step 1: Compact ──
         // 合并小文件碎片，物理删除被标记为已删除的行
+        #[allow(deprecated)]
         let compact_options = CompactionOptions {
             target_rows_per_fragment: 1024 * 1024,  // ~1M 行每文件
             max_rows_per_group: 1024,                // 1K 行每组
             materialize_deletions: true,             // 强制物理删除软删除的行
             materialize_deletions_threshold: 0.1,    // 10% 删除阈值作为后备
-            num_threads: 4,                          // 4 线程并行
+            num_threads: Some(4),                    // 4 线程并行
+            max_bytes_per_file: None,
+            batch_size: None,
+            io_buffer_size: None,
+            defer_index_remap: false,
+            compaction_mode: Some(CompactionMode::Reencode),
+            binary_copy_read_batch_bytes: None,
+            enable_binary_copy: false,
+            enable_binary_copy_force: false,
+            max_source_fragments: None,
+            transaction_properties: None,
         };
 
         let _compact_stats = table
@@ -815,8 +827,9 @@ impl EmbeddingService {
         // 清理 compact 后遗留的旧版本文件
         let _prune_stats = table
             .optimize(OptimizeAction::Prune {
-                older_than: TimeDelta::zero(),   // 立即清理所有非最新版本
+                older_than: Some(TimeDelta::zero()),   // 立即清理所有非最新版本
                 delete_unverified: Some(false),        // 安全：只删除已验证的版本
+                error_if_tagged_old_versions: None,    // 不检查 tagged 版本
             })
             .await
             .map_err(|e| anyhow::anyhow!("LanceDB prune failed: {e}"))?;
