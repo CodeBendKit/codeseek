@@ -1,7 +1,7 @@
 class Codeseek < Formula
   desc "Code intelligence CLI — AST-based call graph + semantic search"
   homepage "https://github.com/CodeBendKit/codeseek"
-  version "v0.1.31"
+  version "0.1.31"
 
   on_macos do
     if Hardware::CPU.arm?
