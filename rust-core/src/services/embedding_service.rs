@@ -51,6 +51,29 @@ fn truncate_to_byte_limit(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// 判断代码块是否应进入 dense（向量）通道。
+///
+/// `min_code_block_length` 是 **dense 专用**阈值，按 `trim()` 后的字符数
+/// （`chars().count()`，**不是字节数**）比较：过短的代码块语义信息不足，
+/// embedding 信噪比低，会拉低向量检索的整体质量。
+///
+/// 注意：该阈值**不得**用于 BM25 稀疏通道（见 [`should_index_bm25`]）——
+/// 短代码块在词项检索里往往是高价值召回，不应因 dense 的质量门槛被裁掉。
+fn should_index_dense(code_block: &str, min_code_block_length: usize) -> bool {
+    code_block.trim().chars().count() >= min_code_block_length
+}
+
+/// 判断代码块是否应进入 BM25（稀疏）通道。
+///
+/// BM25 **不做任何长度过滤**：短代码块往往正是标识符 / 关键字查询
+/// （`fn`、`id`、`useState` …）的目标，相关性交给融合层的 `short_code_penalty`
+/// （见 `services/hybrid_search.rs`）统一降权，而不是在入库前裁掉。
+///
+/// 这里只排除 `trim()` 后为空的块 —— 空文本产生 0 个 token，写入索引没有意义。
+fn should_index_bm25(code_block: &str) -> bool {
+    !code_block.trim().is_empty()
+}
+
 /// 按 Qwen3-Embedding 官方模板为**查询**拼接指令前缀：
 ///
 /// ```text
@@ -630,16 +653,16 @@ impl EmbeddingService {
             };
 
             if let Some((code_block, name, symbol_type_str, language_str, start_row, end_row)) = extracted {
-                // P0: Skip short code blocks to improve retrieval quality
-                // See: docs/retrieval-quality-analysis.md
-                if code_block.trim().chars().count() < self.min_code_block_length {
-                    debug!("Skipping short symbol '{}' ({} chars, min: {})", 
-                        name, code_block.len(), self.min_code_block_length);
-                    continue;
-                }
-                
-                // Index into BM25 if available
-                if self.bm25_index.is_some() {
+                // ── 通道分层：先判 BM25（稀疏），再判 dense（向量）──
+                //
+                // 两个通道的质量判据不同，必须分开处理，不能用同一把尺子：
+                //   * BM25 是词项匹配，短代码块（`fn f()`、`x`）往往正是标识符 / 关键字查询的
+                //     目标，因此**不做长度过滤**，只排除 trim 后为空的块（空文本产生 0 个 token，
+                //     写入索引无意义）。相关性由融合层的 short_code_penalty 统一降权。
+                //   * dense 阈值（min_code_block_length）用于避免语义信息不足的块拉低向量检索
+                //     信噪比，**只作用于向量通道**，绝不能反过来把 BM25 候选一起裁掉。
+                // 规则来源：混合检索分层设计（dense 控语义质量 / BM25 控词项召回 / 融合层控排序）。
+                if self.bm25_index.is_some() && should_index_bm25(&code_block) {
                     let chunk = CodeChunk::new(
                         file_path.to_string_lossy().into_owned(),
                         code_block.clone(),
@@ -650,6 +673,25 @@ impl EmbeddingService {
                         end_row + 1,
                     );
                     bm25_chunks.push(chunk);
+                }
+
+                // dense 通道长度过滤：判据与日志口径统一为**字符数**（trim 后 chars().count()），
+                // 避免中文代码块下「字节数 vs 字符数」口径不一致导致排障误判。
+                if !should_index_dense(&code_block, self.min_code_block_length) {
+                    let code_chars = code_block.trim().chars().count();
+                    debug!(
+                        "Skipping short symbol '{}' from dense channel ({} chars, min: {})",
+                        name, code_chars, self.min_code_block_length
+                    );
+                    // 仅当该块确实已进 BM25（有稀疏索引且非空块）时提示，避免空块场景误报
+                    if self.bm25_index.is_some() && should_index_bm25(&code_block) {
+                        // 已进 BM25、仅被 dense 过滤：便于排障时区分「未召回」与「只走稀疏通道」
+                        debug!(
+                            "Symbol '{}' kept in BM25 sparse channel only ({} chars < dense min {})",
+                            name, code_chars, self.min_code_block_length
+                        );
+                    }
+                    continue;
                 }
 
                 // Check cache first; collect cache-miss items for batch processing
@@ -1255,6 +1297,81 @@ mod tests {
         assert_eq!(svc.embedding_provider.model(), "Qwen/Qwen3-Embedding-4B");
 
         Ok(())
+    }
+
+    // ---- 通道分层：dense 长度阈值 vs BM25 不做长度过滤 ----
+
+    /// BM25 通道不做长度过滤：极短代码块（`fn f()`、`x`）也必须被接受，
+    /// 只有 trim 后为空的块（0 个 token，入库无意义）才被排除。
+    #[test]
+    fn should_index_bm25_accepts_short_code() {
+        for short in ["fn f()", "x", "}", "id", "useState"] {
+            assert!(
+                should_index_bm25(short),
+                "短代码块 {short:?} 必须被 BM25 通道接受（BM25 无长度阈值）"
+            );
+        }
+        // 空文本 / 纯空白：产生 0 个 token，写入索引没有意义
+        assert!(!should_index_bm25(""), "空块不得进入 BM25");
+        assert!(!should_index_bm25("   \n\t "), "纯空白块不得进入 BM25");
+    }
+
+    /// dense 阈值按 trim 后的字符数比较：9 字符块在 min=16 时被过滤，长块通过；
+    /// min=0 时非空块一律通过（与原 `count < min` 判据等价，dense 行为不变）。
+    #[test]
+    fn should_index_dense_respects_threshold() {
+        let short = "fn f() {}";
+        assert_eq!(short.chars().count(), 9);
+        assert!(
+            !should_index_dense(short, 16),
+            "9 字符块在 min=16 时必须被 dense 通道过滤"
+        );
+
+        let long = "fn long_function_name() -> usize { 42 }";
+        assert!(long.chars().count() >= 16);
+        assert!(
+            should_index_dense(long, 16),
+            "长代码块必须通过 dense 阈值"
+        );
+
+        // 阈值为 0 → 非空块全部通过
+        assert!(should_index_dense(short, 0));
+        assert!(should_index_dense(long, 0));
+
+        // 中文块按字符数而非字节数判断：11 字符（33 字节）在 min=16 时仍需过滤
+        let chinese = "函数定义示例代码块内容";
+        assert_eq!(chinese.chars().count(), 11);
+        assert!(
+            chinese.len() > 16,
+            "该中文块字节数已超过阈值，字符数才是判据"
+        );
+        assert!(
+            !should_index_dense(chinese, 16),
+            "dense 阈值必须按字符数而不是字节数判断"
+        );
+    }
+
+    /// 缺陷回归用例：短代码块不得因 dense 阈值被 BM25 通道丢弃。
+    /// 正确分层是「只进 BM25、不进 dense」，而不是「两通道都不进」。
+    #[test]
+    fn short_code_goes_to_bm25_but_not_dense() {
+        let code_block = "x";
+        assert_eq!(code_block.chars().count(), 1);
+
+        assert!(
+            should_index_bm25(code_block),
+            "短代码不得因 dense 阈值被 BM25 丢弃：BM25 通道必须接受 {code_block:?}"
+        );
+        assert!(
+            !should_index_dense(code_block, 16),
+            "同一个块仍应被 dense 阈值过滤（dense 侧行为保持不变）"
+        );
+        // 两个判据互相独立：BM25 为真、dense 为假 —— 即「只进 BM25」
+        assert_ne!(
+            should_index_bm25(code_block),
+            should_index_dense(code_block, 16),
+            "短代码应恰好落在「只进 BM25、不进 dense」的分层区间"
+        );
     }
 
     // ---- truncate_to_byte_limit ----

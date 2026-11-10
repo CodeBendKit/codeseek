@@ -99,6 +99,14 @@ impl EmbeddingConfig {
 /// 索引配置
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct IndexConfig {
+    /// 代码块进入 **dense（向量）通道** 的最小长度，单位为字符数
+    /// （按 `trim()` 后的 `chars().count()` 计，不是字节数）。
+    ///
+    /// 该阈值**仅作用于 dense / 向量通道**：过短的块语义信息不足，embedding 信噪比低，
+    /// 会拉低向量检索质量。
+    ///
+    /// ⚠️ BM25 稀疏通道**不做长度过滤**：短代码块往往正是标识符 / 关键字查询的目标，
+    /// 相关性由融合层的 `short_code_penalty`（`services/hybrid_search.rs`）降权处理。
     #[serde(default = "default_min_code_block_length")]
     pub min_code_block_length: usize,
     #[serde(default)]

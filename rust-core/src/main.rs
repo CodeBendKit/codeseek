@@ -1,28 +1,28 @@
 use clap::Parser;
 use codeseek::cli::args::{Cli, Commands};
+use codeseek::codegraph::types::{FunctionInfo, PetCodeGraph};
 use codeseek::config::Config;
+use codeseek::mcp;
+use codeseek::services::hybrid_search::{HybridSearchConfig, HybridSearchService};
+use codeseek::services::CodeAnalyzer;
+use codeseek::services::EmbeddingService;
 use codeseek::storage::lock::FileLock;
 use codeseek::storage::petgraph_storage::clamp_max_candidates;
 use codeseek::storage::StorageManager;
-use codeseek::codegraph::types::{PetCodeGraph, FunctionInfo};
-use codeseek::services::CodeAnalyzer;
-use codeseek::services::EmbeddingService;
-use codeseek::services::hybrid_search::{HybridSearchService, HybridSearchConfig};
 use codeseek::storage::TantivyBm25Index;
+use codeseek::ui::progress::ProgressBar;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{info, warn};
-use codeseek::ui::progress::ProgressBar;
-use codeseek::mcp;
 use uuid::Uuid;
 
 // Treesitter AST skeletonizer imports
-use codeseek::codegraph::treesitter::structs::SymbolType;
 use codeseek::codegraph::treesitter::ast_instance_structs::SymbolInformation;
 use codeseek::codegraph::treesitter::make_formatter;
 use codeseek::codegraph::treesitter::parsers::get_ast_parser_by_filename;
+use codeseek::codegraph::treesitter::structs::SymbolType;
 
 /// 从当前工作目录检测项目根（向上找 .git/）
 fn detect_project() -> Result<PathBuf, String> {
@@ -42,15 +42,16 @@ fn project_paths(project_root: &PathBuf) -> (PathBuf, PathBuf) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if cli.verbose {
-                tracing_subscriber::EnvFilter::new("debug")
-            } else {
-                tracing_subscriber::EnvFilter::new("warn")
-            }
-        });
-    tracing_subscriber::fmt().with_env_filter(filter_layer).init();
+    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if cli.verbose {
+            tracing_subscriber::EnvFilter::new("debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("warn")
+        }
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter_layer)
+        .init();
 
     // Phase P3 收口 B（交付物 1）：`--levels` 的**缓存陈旧** fail-fast。
     // 必须在这里（任何缓存/图读取之前）就拦住：`--levels` 会改变产出的调用边，但它
@@ -146,7 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut pet_graph = existing_graph.unwrap_or_else(|| PetCodeGraph::new());
 
             if new_stats.total_functions > 0 {
-                let changed_files: std::collections::HashSet<_> = code_graph.functions.values()
+                let changed_files: std::collections::HashSet<_> = code_graph
+                    .functions
+                    .values()
                     .map(|f| f.file_path.clone())
                     .collect();
                 for file in &changed_files {
@@ -171,7 +174,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "indexed_at": chrono::Utc::now().to_rfc3339(),
             });
             std::fs::create_dir_all(&index_dir)?;
-            std::fs::write(index_dir.join("project.json"), serde_json::to_string_pretty(&meta)?)?;
+            std::fs::write(
+                index_dir.join("project.json"),
+                serde_json::to_string_pretty(&meta)?,
+            )?;
 
             let stats = pet_graph.get_stats().clone();
             // Phase P3 收口：落盘必须带上**本轮建图用的**解析档位戳（档位 + 候选上限），
@@ -193,14 +199,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pb.set_phase("Building vector embeddings...");
                     pb.set_stats(stats.total_files, stats.total_functions);
 
-                    let db_path = Config::lancedb_dir(&project_hash).to_string_lossy().to_string();
+                    let db_path = Config::lancedb_dir(&project_hash)
+                        .to_string_lossy()
+                        .to_string();
                     let collection = format!("codeseek_{}", &project_hash[..8]);
 
                     // 创建BM25索引用于稀疏检索通道
                     let bm25_dir = Config::bm25_dir(&project_hash);
-                    let bm25_index = TantivyBm25Index::open_or_create(&bm25_dir)
-                        .ok()
-                        .map(|idx| Arc::new(idx) as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>);
+                    // 先保留具体类型实例：转成 trait object 后就读不到 was_rebuilt() 了
+                    let bm25_concrete = TantivyBm25Index::open_or_create(&bm25_dir).ok();
+                    // BM25 索引若因 schema/tokenizer 变更被重建，稀疏通道此刻是空的
+                    let bm25_rebuilt = bm25_concrete
+                        .as_ref()
+                        .map(|i| i.was_rebuilt())
+                        .unwrap_or(false);
+                    let bm25_index = bm25_concrete.map(|idx| {
+                        Arc::new(idx) as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>
+                    });
 
                     embedding_done = true; // mark attempted; actual success tracked below
                     match EmbeddingService::new(&db_path, collection, Some(cfg), bm25_index).await {
@@ -210,15 +225,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 embedding_done = false;
                             } else {
                                 // Load previous file hashes to detect deletions
-                                let existing_hashes = EmbeddingService::load_hashes(&project_hash);
-                                match es.vectorize_directory(
-                                    &project_root.to_string_lossy(),
-                                    existing_hashes.as_ref(),
-                                ).await {
+                                // BM25 索引刚被重建时，增量索引不会回填稀疏通道（已索引文件不会重新生成
+                                // CodeChunk），必须传 None 走全量索引，否则稀疏检索会静默变空。
+                                let existing_hashes = if bm25_rebuilt {
+                                    warn!(
+                                        "BM25 索引已因 schema/tokenizer 变更重建，本轮改为全量索引以回填稀疏通道"
+                                    );
+                                    None
+                                } else {
+                                    EmbeddingService::load_hashes(&project_hash)
+                                };
+                                match es
+                                    .vectorize_directory(
+                                        &project_root.to_string_lossy(),
+                                        existing_hashes.as_ref(),
+                                    )
+                                    .await
+                                {
                                     Ok(new_hashes) => {
                                         pb.set_stats(new_hashes.len(), stats.total_functions);
                                         // Persist hashes for next incremental run
-                                        if let Err(e) = EmbeddingService::save_hashes(&project_hash, &new_hashes) {
+                                        if let Err(e) = EmbeddingService::save_hashes(
+                                            &project_hash,
+                                            &new_hashes,
+                                        ) {
                                             warn!("Failed to save embedding hashes: {}", e);
                                         }
                                     }
@@ -239,7 +269,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pb.set_pct(100);
 
             let suffix = if embedding_done { " + embeddings" } else { "" };
-            pb.finish(&format!("{} files, {} functions{}", stats.total_files, stats.total_functions, suffix));
+            pb.finish(&format!(
+                "{} files, {} functions{}",
+                stats.total_files, stats.total_functions, suffix
+            ));
         }
         Commands::Status { json } => {
             let project_root = detect_project()?;
@@ -289,21 +322,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let project_hash = Config::compute_project_hash(&project_root);
                     let collection = format!("codeseek_{}", &project_hash[..8]);
                     // LanceDB 存储在项目目录下的 lancedb/ 子目录
-                    let db_path = Config::lancedb_dir(&project_hash).to_string_lossy().to_string();
+                    let db_path = Config::lancedb_dir(&project_hash)
+                        .to_string_lossy()
+                        .to_string();
 
-                    if let Ok(es) = EmbeddingService::new(&db_path, collection, Some(cfg), None).await {
+                    if let Ok(es) =
+                        EmbeddingService::new(&db_path, collection, Some(cfg), None).await
+                    {
                         // BM25 索引存储在项目目录下的 tantivy_bm25/ 子目录
                         let bm25_dir = Config::bm25_dir(&project_hash);
-                        let bm25_index = TantivyBm25Index::open_or_create(&bm25_dir)
-                            .ok()
-                            .map(|idx| Arc::new(idx) as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>);
+                        let bm25_index =
+                            TantivyBm25Index::open_or_create(&bm25_dir).ok().map(|idx| {
+                                Arc::new(idx)
+                                    as Arc<dyn codeseek::storage::traits_bm25::TextSearchProvider>
+                            });
 
                         if let Some(bm25) = bm25_index {
                             let hybrid_cfg = &cfg.index.hybrid;
                             let reranker_cfg = &cfg.index.reranker;
 
-                            let hybrid = if reranker_cfg.enabled && !reranker_cfg.api_token.is_empty() {
-                                let reranker = codeseek::services::RerankerService::new(reranker_cfg.clone());
+                            let hybrid = if reranker_cfg.enabled
+                                && !reranker_cfg.api_token.is_empty()
+                            {
+                                let reranker =
+                                    codeseek::services::RerankerService::new(reranker_cfg.clone());
                                 HybridSearchService::with_reranker(
                                     Arc::new(es),
                                     bm25,
@@ -356,13 +398,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(Some(graph)) = storage.get_persistence().load_graph(&project_hash) {
                     let funcs = graph.find_functions_by_name(query);
                     if *json {
-                        let output: Vec<_> = funcs.iter().map(|f| serde_json::json!({
-                            "name": f.name,
-                            "file_path": f.file_path,
-                            "line_start": f.line_start,
-                            "line_end": f.line_end,
-                            "language": f.language,
-                        })).collect();
+                        let output: Vec<_> = funcs
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "name": f.name,
+                                    "file_path": f.file_path,
+                                    "line_start": f.line_start,
+                                    "line_end": f.line_end,
+                                    "language": f.language,
+                                })
+                            })
+                            .collect();
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else if funcs.is_empty() {
                         println!("No results found.");
@@ -435,7 +482,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Callgraph { symbol, depth, json } => {
+        Commands::Callgraph {
+            symbol,
+            depth,
+            json,
+        } => {
             let project_root = detect_project()?;
             let (_, lock_path) = project_paths(&project_root);
             let _lock = FileLock::shared(lock_path)?;
@@ -502,13 +553,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let meta_file = path.join("project.json");
                         if meta_file.exists() {
                             if let Ok(content) = std::fs::read_to_string(&meta_file) {
-                                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                                    let hash = path.file_name().unwrap_or_default().to_string_lossy();
+                                if let Ok(meta) =
+                                    serde_json::from_str::<serde_json::Value>(&content)
+                                {
+                                    let hash =
+                                        path.file_name().unwrap_or_default().to_string_lossy();
                                     let graph_file = path.join("graph.bin");
                                     let functions = if graph_file.exists() {
                                         let s = graph_file.metadata().map(|m| m.len()).unwrap_or(0);
                                         format!("{}", s)
-                                    } else { "—".to_string() };
+                                    } else {
+                                        "—".to_string()
+                                    };
                                     projects.push(serde_json::json!({
                                         "project_root": meta["project_root"],
                                         "hash": hash,
@@ -528,7 +584,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("No indexed projects found.");
             } else {
                 for p in &projects {
-                    println!("  {}  →  {}", p["hash"].as_str().unwrap_or("?").chars().take(12).collect::<String>(), p["project_root"].as_str().unwrap_or("?"));
+                    println!(
+                        "  {}  →  {}",
+                        p["hash"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .chars()
+                            .take(12)
+                            .collect::<String>(),
+                        p["project_root"].as_str().unwrap_or("?")
+                    );
                 }
             }
         }
@@ -547,24 +612,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             uninstall_from_claude()?;
             uninstall_from_codex()?;
         }
-        Commands::Skeleton { file_paths, json } => {
-            match execute_skeleton(file_paths, *json) {
-                Ok(output) => print!("{}", output),
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        Commands::Skeleton { file_paths, json } => match execute_skeleton(file_paths, *json) {
+            Ok(output) => print!("{}", output),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
-        }
-        Commands::Snippet { function_name, file_path, json } => {
-            match execute_snippet(function_name, file_path.as_deref(), *json) {
-                Ok(output) => print!("{}", output),
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        },
+        Commands::Snippet {
+            function_name,
+            file_path,
+            json,
+        } => match execute_snippet(function_name, file_path.as_deref(), *json) {
+            Ok(output) => print!("{}", output),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
-        }
+        },
         Commands::InstallHooks => {
             let project_root = detect_project()?;
             let git_dir = project_root.join(".git");
@@ -623,7 +688,11 @@ fn resolution_annotation(relation: &codeseek::codegraph::types::CallRelation) ->
         relation.resolution_level,
         relation.confidence,
         relation.candidate_count,
-        if relation.candidate_count >= 2 { " ambiguous" } else { "" }
+        if relation.candidate_count >= 2 {
+            " ambiguous"
+        } else {
+            ""
+        }
     )
 }
 
@@ -632,10 +701,19 @@ fn resolution_json_fields(
     relation: &codeseek::codegraph::types::CallRelation,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
-    map.insert("resolution_level".into(), serde_json::json!(relation.resolution_level));
+    map.insert(
+        "resolution_level".into(),
+        serde_json::json!(relation.resolution_level),
+    );
     map.insert("confidence".into(), serde_json::json!(relation.confidence));
-    map.insert("candidate_count".into(), serde_json::json!(relation.candidate_count));
-    map.insert("ambiguous".into(), serde_json::json!(relation.candidate_count >= 2));
+    map.insert(
+        "candidate_count".into(),
+        serde_json::json!(relation.candidate_count),
+    );
+    map.insert(
+        "ambiguous".into(),
+        serde_json::json!(relation.candidate_count >= 2),
+    );
     map
 }
 
@@ -790,7 +868,10 @@ fn claude_settings_path(local: bool) -> PathBuf {
 }
 
 fn codex_config_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".codex").join("config.toml")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".codex")
+        .join("config.toml")
 }
 
 fn install_to_claude() -> Result<(), Box<dyn std::error::Error>> {
@@ -802,7 +883,11 @@ fn install_to_claude() -> Result<(), Box<dyn std::error::Error>> {
     {
         (local, claude_settings_path(true), "local")
     } else {
-        (claude_global_mcp_path(), claude_settings_path(false), "global")
+        (
+            claude_global_mcp_path(),
+            claude_settings_path(false),
+            "global",
+        )
     };
 
     // 1. Write MCP server entry
@@ -910,8 +995,14 @@ fn uninstall_from_claude() -> Result<(), Box<dyn std::error::Error>> {
     if mcp_path.exists() {
         let content = std::fs::read_to_string(&mcp_path)?;
         let mut config: serde_json::Value = serde_json::from_str(&content)?;
-        if config.get("mcpServers").and_then(|s| s.get("codeseek")).is_some() {
-            config["mcpServers"].as_object_mut().map(|s| s.remove("codeseek"));
+        if config
+            .get("mcpServers")
+            .and_then(|s| s.get("codeseek"))
+            .is_some()
+        {
+            config["mcpServers"]
+                .as_object_mut()
+                .map(|s| s.remove("codeseek"));
             std::fs::write(&mcp_path, serde_json::to_string_pretty(&config)?)?;
             println!("  ✓ Removed from {}", mcp_path.display());
         }
@@ -989,10 +1080,8 @@ fn generate_skeleton_for_file(file_path_str: &str) -> Result<String, String> {
     }
 
     // 6. 构建 guid_to_info 引用映射
-    let guid_to_info: HashMap<Uuid, &SymbolInformation> = symbols_info
-        .iter()
-        .map(|s| (s.guid.clone(), s))
-        .collect();
+    let guid_to_info: HashMap<Uuid, &SymbolInformation> =
+        symbols_info.iter().map(|s| (s.guid.clone(), s)).collect();
 
     // 7. 识别顶层符号（其 GUID 不是任何其他符号的子节点）
     let all_children_guids: HashSet<Uuid> = guid_to_children
@@ -1011,7 +1100,10 @@ fn generate_skeleton_for_file(file_path_str: &str) -> Result<String, String> {
     top_level_symbols.sort_by_key(|s| s.full_range.start_point.row);
 
     if top_level_symbols.is_empty() {
-        return Ok(format!("// No structural symbols found in {}", file_path_str));
+        return Ok(format!(
+            "// No structural symbols found in {}",
+            file_path_str
+        ));
     }
 
     // 8. 对每个顶层符号生成骨架
@@ -1034,7 +1126,7 @@ fn execute_skeleton(
     for file_path_str in file_paths {
         let input_path = PathBuf::from(file_path_str);
         let language = detect_language(&input_path);
-        
+
         let skeleton_text = match generate_skeleton_for_file(file_path_str) {
             Ok(text) => text,
             Err(e) => format!("// Error: {}", e),
@@ -1104,8 +1196,16 @@ fn execute_snippet(
     }
 
     if candidates.len() > 1 && file_path.is_none() {
-        let locations: Vec<String> = candidates.iter()
-            .map(|f| format!("  {}:{} (line {})", f.file_path.display(), f.name, f.line_start))
+        let locations: Vec<String> = candidates
+            .iter()
+            .map(|f| {
+                format!(
+                    "  {}:{} (line {})",
+                    f.file_path.display(),
+                    f.name,
+                    f.line_start
+                )
+            })
             .collect();
         let result = serde_json::json!({
             "success": false,
@@ -1178,7 +1278,8 @@ fn detect_language(path: &Path) -> String {
         "lua" => "lua",
         "zig" => "zig",
         _ => "unknown",
-    }.to_string()
+    }
+    .to_string()
 }
 
 /// Read a line range [start, end] (1-indexed, inclusive) from a file.
@@ -1191,7 +1292,9 @@ fn read_line_range(file_path: &Path, line_start: usize, line_end: usize) -> Resu
     if start_idx >= lines.len() {
         return Err(format!(
             "Line range [{}, {}] out of bounds (file has {} lines)",
-            line_start, line_end, lines.len()
+            line_start,
+            line_end,
+            lines.len()
         ));
     }
     Ok(lines[start_idx..end_idx].join("\n"))

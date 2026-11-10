@@ -101,6 +101,12 @@ Create or edit `~/.codeseek/config.json`:
 to the **query only** (`Instruct: {instruct}\nQuery:{query}`); indexed code stays raw text.
 Omit the field to use the built-in default above; set it to `""` to disable the prefix entirely.
 
+`min_code_block_length` applies to the **dense (vector) channel only**: it is a minimum block length
+in characters (measured after `trim()`), because shorter blocks carry too little semantic signal and
+lower embedding retrieval quality. The **BM25 sparse channel performs no length filtering** — short
+blocks are often exactly what identifier / keyword queries look for — and their relevance is instead
+down-weighted by the fusion layer's `short_code_penalty`.
+
 Then run `codeseek init` to build the index with embeddings.
 
 ## Model dimension reference
