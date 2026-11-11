@@ -68,7 +68,10 @@ impl Default for HybridSearchConfig {
 ///
 /// 降级方向（两通道对称）：dense 失败 → sparse-only；sparse 禁用/失败 → dense-only；
 /// dense 失败且无可用 sparse → 返回 `Err`，由调用方回退到 PetCodeGraph 名称搜索。
-/// 降级路径跳过 RRF 与 Reranker，详见 [`HybridSearchService::search`]。
+///
+/// 降级路径一律跳过 RRF；是否执行 Reranker 取决于正文是否可得：sparse-only 降级会先用
+/// [`HybridSearchService::hydrate_code_blocks`] 回填正文再精排，dense-only 降级正文自带，
+/// 但没有另一侧可比较的分数，因此仍不重排。详见 [`HybridSearchService::search`]。
 pub struct HybridSearchService {
     dense: Arc<EmbeddingService>,
     sparse: Arc<dyn TextSearchProvider>,
@@ -122,13 +125,60 @@ fn sparse_line_start(sr: &TextSearchResult) -> usize {
         .unwrap_or(0)
 }
 
+/// BM25 通道回填正文时，从 `line_start` 起最多读取的行数。
+///
+/// BM25 索引不存 `line_end`（Tantivy schema 里没有该字段），无法得知符号真实结束行，
+/// 因此取一个足够宽的窗口而不是试图精确截断：多读几行上下文比截断到半句更利于
+/// cross-encoder 打分，也比留下空文档强。
+const BM25_BACKFILL_MAX_LINES: usize = 60;
+
+/// 从整份文件内容中按 1-based 闭区间 `[line_start, line_end]` 切出代码片段。
+///
+/// `line_end == 0`（BM25 通道不存结束行）时退化为 `line_start .. line_start + fallback_lines`
+/// 的窗口。返回 `(片段, 实际结束行)`；行号不可用（`line_start == 0`）、越界、或片段全是
+/// 空白时返回 `None` —— 调用方据此保持候选原样，绝不把半截或空白噪声写进证据。
+///
+/// 结果保留原始缩进（不做 trim），因为缩进本身也是代码正文的一部分。
+fn slice_code_lines(
+    content: &str,
+    line_start: usize,
+    line_end: usize,
+    fallback_lines: usize,
+) -> Option<(String, usize)> {
+    if line_start == 0 {
+        return None;
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if line_start > total {
+        return None;
+    }
+
+    let end = if line_end >= line_start {
+        // dense 通道给了真实结束行：沿用它，越界则 clamp 到文件末尾
+        line_end.min(total)
+    } else {
+        // BM25 通道没有结束行：向后取固定窗口
+        let window = fallback_lines.max(1);
+        line_start.saturating_add(window - 1).min(total)
+    };
+
+    let snippet = lines[line_start - 1..end].join("\n");
+    if snippet.trim().is_empty() {
+        return None;
+    }
+    Some((snippet, end))
+}
+
 impl From<&TextSearchResult> for FusionMeta {
     fn from(sr: &TextSearchResult) -> Self {
         Self {
             file_path: sr.file_path.clone(),
             symbol_name: sr.symbol_name.clone(),
             language: sr.language.clone(),
-            // BM25 通道不存储正文（content 非 STORED），保持为空串
+            // BM25 通道不存储正文（content 非 STORED），保持为空串；
+            // 正文由 [`HybridSearchService::hydrate_code_blocks`] 在调用侧从源文件回填
             code_block: String::new(),
             // 行号从 snippet_id 反解得到（Tantivy 未存 line_start 字段）
             line_start: sparse_line_start(sr),
@@ -211,9 +261,16 @@ impl HybridSearchService {
     /// - dense 失败且 sparse 被禁用 / 也失败 → 返回 `Err`，由调用方回退到
     ///   PetCodeGraph 名称搜索（见 `main.rs` 的 `use_graph_fallback`）
     ///
-    /// 降级路径**不执行 RRF 与 Reranker**：与现有 sparse 失败降级保持一致 —— 存活
-    /// 通道的候选缺少可比较的另一侧分数，且 BM25 命中不带 `code_block` 正文，
-    /// cross-encoder 无文本可打分，强行精排只会引入噪声。
+    /// 降级路径**不执行 RRF**：存活通道的候选缺少可比较的另一侧分数。是否执行
+    /// Reranker 则取决于正文是否可得：
+    /// - sparse-only 降级：BM25 不存正文，但候选会先经 [`Self::hydrate_code_blocks`]
+    ///   从源文件回填 `code_block`；正文补上后「cross-encoder 无文本可打分」这个原本
+    ///   跳过精排的理由消失，因此**会**执行 rerank；
+    /// - dense-only 降级：正文由 dense 通道自带，但没有另一侧分数可融合，降级语义
+    ///   保持为「原样输出、不重排」。
+    ///
+    /// 融合主路径同样先回填正文再进 reranker：`SparseOnly` 候选（以及缺正文的
+    /// `Fused` 候选）在精排输入与最终证据里都必须是带正文的。
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<FusedCandidate>> {
         if query.is_empty() {
             return Ok(Vec::new());
@@ -241,7 +298,7 @@ impl HybridSearchService {
         };
 
         // 两通道结果对称处理：任一条通道存活即出结果，只有两条都不可用时才整体失败
-        let fused: Vec<FusedCandidate> = match (dense_res, sparse_res_opt) {
+        let mut fused: Vec<FusedCandidate> = match (dense_res, sparse_res_opt) {
             (Ok(dense), Some(Ok(sparse))) => {
                 debug!("Sparse channel returned {} results", sparse.len());
                 // Perform RRF fusion — 返回足够的候选供后续 rerank 使用
@@ -253,7 +310,8 @@ impl HybridSearchService {
                     "Sparse (BM25) channel failed, falling back to dense-only: {}",
                     e
                 );
-                // 降级：不施加 RRF / 短代码惩罚，也不进 reranker
+                // 降级：不施加 RRF / 短代码惩罚，也不进 reranker。
+                // dense 候选的正文自带，无需 hydrate_code_blocks，降级语义保持不变。
                 return Ok(Self::dense_only_candidates(dense, limit));
             }
             (Ok(dense), None) => {
@@ -266,8 +324,20 @@ impl HybridSearchService {
                     "Dense (vector) channel failed, falling back to sparse-only (BM25): {}",
                     dense_e
                 );
-                // 降级：BM25 不存正文，cross-encoder 无文本可打分 → 同样跳过 reranker
-                return Ok(Self::sparse_only_candidates(sparse, limit));
+                // 降级：先用完整 BM25 池构造候选（上限取池长度，避免回填前就被 limit
+                // 截断），回填正文后再决定是否精排 —— 正文补上后「cross-encoder 无文本
+                // 可打分」这个原本跳过 reranker 的理由不再成立。
+                let pool_len = sparse.len();
+                let mut candidates = Self::sparse_only_candidates(sparse, pool_len.max(limit));
+                Self::hydrate_code_blocks(&mut candidates).await;
+
+                if let Some(ref reranker) = self.reranker {
+                    if reranker.config().enabled {
+                        return self.apply_rerank(reranker, query, candidates, limit).await;
+                    }
+                }
+                candidates.truncate(limit);
+                return Ok(candidates);
             }
             (Err(dense_e), Some(Err(sparse_e))) => {
                 // 两条通道都不可用 → 聚合 Err，由调用方回退到 PetCodeGraph 名称搜索
@@ -288,6 +358,10 @@ impl HybridSearchService {
 
         debug!("Hybrid search returned {} fused candidates (before rerank)", fused.len());
 
+        // BM25 通道的 content 非 STORED，`SparseOnly` 候选天然没有正文：进 reranker 前
+        // 必须先在磁盘上补齐，否则 cross-encoder 收到空 document、最终证据也是空的
+        Self::hydrate_code_blocks(&mut fused).await;
+
         // Phase 2: Optional Cross-Encoder Rerank
         if let Some(ref reranker) = self.reranker {
             if reranker.config().enabled {
@@ -299,6 +373,71 @@ impl HybridSearchService {
         let mut result = fused;
         result.truncate(limit);
         Ok(result)
+    }
+
+    /// 为缺少正文的候选从源文件回填代码片段。
+    ///
+    /// BM25 通道的 content 字段非 STORED，`SparseOnly` 候选天然没有正文；不补的话
+    /// cross-encoder 收到空 document、最终证据也是空的。同一 `file_path` 只读一次；
+    /// 读取失败/行号不可用时保持原样并 warn，绝不影响整体搜索。
+    ///
+    /// 只处理「正文为空 + 行号可用 + 路径非空」的候选（dense 自带的正文是权威数据，
+    /// 绝不覆盖）。不返回 `Result`：回填是尽力而为的增强，失败退化为修复前的行为。
+    async fn hydrate_code_blocks(candidates: &mut [FusedCandidate]) {
+        // 按文件归组待回填候选的下标：一个文件可能命中多个符号，没必要重复读盘
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, c) in candidates.iter().enumerate() {
+            if c.code_block.trim().is_empty() && c.line_start > 0 && !c.file_path.is_empty() {
+                by_file.entry(c.file_path.clone()).or_default().push(idx);
+            }
+        }
+        if by_file.is_empty() {
+            return;
+        }
+
+        let mut hydrated = 0usize;
+        let mut failed_files = 0usize;
+
+        for (path, indices) in by_file {
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(e) => {
+                    // 索引可能比工作区旧（文件已删/已改路径），只降级不失败
+                    warn!("BM25 正文回填跳过 {}：{}", path, e);
+                    failed_files += 1;
+                    continue;
+                }
+            };
+
+            for idx in indices {
+                let (line_start, line_end) = {
+                    let c = &candidates[idx];
+                    (c.line_start, c.line_end)
+                };
+                match slice_code_lines(&content, line_start, line_end, BM25_BACKFILL_MAX_LINES) {
+                    Some((snippet, real_end)) => {
+                        let c = &mut candidates[idx];
+                        c.code_block = snippet;
+                        // BM25 通道原本没有结束行（0），回填后写入真实结束行
+                        if c.line_end == 0 {
+                            c.line_end = real_end;
+                        }
+                        hydrated += 1;
+                    }
+                    None => {
+                        debug!(
+                            "BM25 正文回填无有效片段：{}:{}（行号越界或该区间全为空白）",
+                            path, line_start
+                        );
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "BM25 正文回填完成：成功 {} 条，读取失败文件 {} 个",
+            hydrated, failed_files
+        );
     }
 
     /// 降级：仅 dense 通道可用时，把向量命中原样转成候选（不施加 RRF / 短代码惩罚）。
@@ -329,8 +468,11 @@ impl HybridSearchService {
     /// BM25 不存储正文（schema 里 content 非 STORED），故 `code_block` 为空、
     /// `line_end` 为 0；行号优先取 provider 已填充的 `line_start`，否则从
     /// `snippet_id` 反解（见 [`sparse_line_start`]）。顺序沿用 BM25 相关性排序，
-    /// `final_score` 直接取 BM25 分数，因此同样**不进 reranker** —— cross-encoder
-    /// 没有正文可打分。纯函数，不依赖 `self`，便于单测。
+    /// `final_score` 直接取 BM25 分数。
+    ///
+    /// 空 `code_block` 与 `line_end == 0` 只是**构造时**的状态：正文由调用侧的
+    /// [`HybridSearchService::hydrate_code_blocks`] 从源文件回填，并顺带补上真实的
+    /// `line_end`。因此本函数保持纯函数、不依赖 `self`，便于单测。
     fn sparse_only_candidates(sparse: Vec<TextSearchResult>, limit: usize) -> Vec<FusedCandidate> {
         sparse
             .into_iter()
@@ -747,5 +889,192 @@ mod tests {
         assert_eq!(candidates[1].final_score, 2.0);
         // provider 已给出非 0 行号时以它为准，不从 id 反解覆盖
         assert_eq!(candidates[1].line_start, 5);
+    }
+
+    // ---- slice_code_lines ------------------------------------------------
+
+    #[test]
+    fn slice_code_lines_respects_explicit_range() {
+        let content = "line1\nline2\nline3\nline4";
+
+        let (snippet, end) = slice_code_lines(content, 2, 3, 60).expect("1-based 闭区间应可切分");
+
+        assert_eq!(snippet, "line2\nline3");
+        assert_eq!(end, 3, "返回的结束行必须是真实的结束行");
+    }
+
+    #[test]
+    fn slice_code_lines_uses_window_when_line_end_unknown() {
+        let content = "l1\nl2\nl3\nl4\nl5";
+
+        // BM25 通道没有结束行（line_end == 0）：按 fallback 窗口向后取
+        let (snippet, end) = slice_code_lines(content, 2, 0, 3).expect("窗口切分应成功");
+        assert_eq!(snippet, "l2\nl3\nl4");
+        assert_eq!(end, 4, "结束行应是窗口末行，而不是留在 0");
+
+        // 窗口超出文件末尾时必须 clamp，不能 panic
+        let (snippet, end) = slice_code_lines(content, 4, 0, 60).expect("越界窗口应被 clamp");
+        assert_eq!(snippet, "l4\nl5");
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn slice_code_lines_rejects_unusable_line_numbers() {
+        let content = "a\nb";
+
+        assert!(
+            slice_code_lines(content, 3, 0, 60).is_none(),
+            "line_start 越界应返回 None"
+        );
+        assert!(
+            slice_code_lines(content, 0, 2, 60).is_none(),
+            "line_start == 0 表示行号未知"
+        );
+        assert!(
+            slice_code_lines("", 1, 0, 60).is_none(),
+            "空文件没有可切的内容"
+        );
+    }
+
+    #[test]
+    fn slice_code_lines_rejects_blank_snippet() {
+        let content = "code\n   \n\t\nmore";
+
+        assert!(
+            slice_code_lines(content, 2, 3, 60).is_none(),
+            "全空白的片段不应写进证据"
+        );
+    }
+
+    #[test]
+    fn slice_code_lines_keeps_original_indentation() {
+        let content = "fn main() {\n    let x = 1;\n}";
+
+        let (snippet, _) = slice_code_lines(content, 2, 0, 1).expect("单行窗口应可切分");
+
+        assert_eq!(snippet, "    let x = 1;", "缩进属于正文，不能被 trim 掉");
+    }
+
+    // ---- hydrate_code_blocks ---------------------------------------------
+
+    /// 在临时目录里写一个源文件，返回 `(必须保活的 TempDir, 路径字符串)`。
+    fn write_temp_source(file_name: &str, content: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, content).expect("写入临时源文件失败");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn make_candidate(
+        file_path: &str,
+        line_start: usize,
+        line_end: usize,
+        code_block: &str,
+    ) -> FusedCandidate {
+        FusedCandidate {
+            snippet_id: CodeChunk::generate_id(file_path, line_start, "sym"),
+            final_score: 0.5,
+            file_path: file_path.to_string(),
+            symbol_name: "sym".to_string(),
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            code_block: code_block.to_string(),
+            source: CandidateSource::SparseOnly,
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_fills_missing_body_from_disk() {
+        let source = "fn a() {}\nfn b() {\n    let v = 1;\n    v\n}\n";
+        let (_dir, path) = write_temp_source("a.rs", source);
+
+        let mut candidates = vec![make_candidate(&path, 2, 0, "")];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        let c = &candidates[0];
+        assert!(
+            c.code_block.contains("fn b()"),
+            "正文应从源文件回填，实际：{:?}",
+            c.code_block
+        );
+        assert!(c.code_block.contains("let v = 1;"));
+        assert!(c.line_end > 0, "回填时顺带补上真实结束行，不应还是 0");
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_never_overwrites_existing_body() {
+        let source = "fn a() {}\n";
+        let (_dir, path) = write_temp_source("a.rs", source);
+
+        let original = "dense 通道自带的正文，必须原样保留";
+        let mut candidates = vec![make_candidate(&path, 1, 1, original)];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert_eq!(
+            candidates[0].code_block, original,
+            "已有正文是权威数据，不得覆盖"
+        );
+        assert_eq!(candidates[0].line_end, 1, "已有的结束行也不应被改写");
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_survives_missing_file() {
+        let mut candidates = vec![make_candidate("/nonexistent/codeseek/ghost.rs", 1, 0, "")];
+
+        // 关键断言是「不 panic 也不返回错误」：这里的调用能正常返回即通过
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert!(candidates[0].code_block.is_empty(), "读不到文件时保持原样");
+        assert_eq!(candidates[0].line_end, 0);
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_slices_multiple_candidates_of_same_file() {
+        let source = "fn one() {}\nfn two() {}\nfn three() {}\n";
+        let (_dir, path) = write_temp_source("b.rs", source);
+
+        // 同一文件的 2 条候选：归组后只读一次盘，但每条都要切到自己的片段
+        let mut candidates = vec![
+            make_candidate(&path, 1, 0, ""),
+            make_candidate(&path, 3, 0, ""),
+        ];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert!(candidates[0].code_block.contains("fn one()"));
+        assert!(candidates[1].code_block.contains("fn three()"));
+        assert!(candidates[0].line_end > 0 && candidates[1].line_end > 0);
+    }
+
+    #[tokio::test]
+    async fn sparse_only_fusion_result_gets_body_after_hydration() {
+        // 端到端复现原 bug：fuse 产出 SparseOnly 空正文 → hydrate → 正文非空
+        let source = "pub fn target() {\n    do_something();\n}\n";
+        let (_dir, path) = write_temp_source("e2e.rs", source);
+
+        let config = HybridSearchConfig::default();
+        let sparse = vec![make_sparse(
+            &CodeChunk::generate_id(&path, 1, "target"),
+            &path,
+            "target",
+            0,
+        )];
+        let mut fused = HybridSearchService::fuse(Vec::new(), sparse, &config, 10);
+
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].source, CandidateSource::SparseOnly);
+        assert!(
+            fused[0].code_block.is_empty(),
+            "BM25 通道构造时候选本就没有正文"
+        );
+
+        HybridSearchService::hydrate_code_blocks(&mut fused).await;
+
+        assert!(
+            !fused[0].code_block.trim().is_empty(),
+            "回填后最终证据不能是空正文"
+        );
+        assert!(fused[0].code_block.contains("do_something()"));
+        assert!(fused[0].line_end > 0);
     }
 }
