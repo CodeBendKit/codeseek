@@ -9,8 +9,15 @@ use tracing::info;
 pub struct HybridSearchConfig {
     #[serde(default = "default_true")]
     pub enable_bm25: bool,
+    /// 映射到 `services::HybridSearchConfig.sparse_limit` —— BM25 通道取回条数的下界。
+    ///
+    /// 实际取回条数与 RRF 保留条数由 `SearchBudget` 推导：
+    /// `K_recall = max(bm25_top_k, vector_top_k, K_rerank)`，不再单独决定融合截断长度。
     #[serde(default = "default_100")]
     pub bm25_top_k: usize,
+    /// 映射到 `services::HybridSearchConfig.dense_limit` —— 向量通道取回条数的下界。
+    ///
+    /// 与 `bm25_top_k` 一起构成 `K_recall` 的下界（见上）。
     #[serde(default = "default_100")]
     pub vector_top_k: usize,
     #[serde(default = "default_rrf_k")]
@@ -23,12 +30,24 @@ pub struct HybridSearchConfig {
     pub short_code_penalty: f64,
 }
 
-fn default_true() -> bool { true }
-fn default_100() -> usize { 100 }
-fn default_20() -> usize { 20 }
-fn default_rrf_k() -> f64 { 60.0 }
-fn default_short_code_threshold() -> usize { 30 }
-fn default_short_code_penalty() -> f64 { 0.5 }
+fn default_true() -> bool {
+    true
+}
+fn default_100() -> usize {
+    100
+}
+fn default_20() -> usize {
+    20
+}
+fn default_rrf_k() -> f64 {
+    60.0
+}
+fn default_short_code_threshold() -> usize {
+    30
+}
+fn default_short_code_penalty() -> f64 {
+    0.5
+}
 
 impl Default for HybridSearchConfig {
     fn default() -> Self {
@@ -76,11 +95,21 @@ pub struct EmbeddingConfig {
     pub instruct: Option<String>,
 }
 
-fn default_provider() -> String { "openai-compatible".to_string() }
-fn default_model() -> String { "Qwen/Qwen3-Embedding-4B".to_string() }
-fn default_api_base_url() -> String { "https://api.siliconflow.cn/v1".to_string() }
-fn default_dimensions() -> usize { 2560 }
-fn default_instruct() -> Option<String> { Some(DEFAULT_QUERY_INSTRUCT.to_string()) }
+fn default_provider() -> String {
+    "openai-compatible".to_string()
+}
+fn default_model() -> String {
+    "Qwen/Qwen3-Embedding-4B".to_string()
+}
+fn default_api_base_url() -> String {
+    "https://api.siliconflow.cn/v1".to_string()
+}
+fn default_dimensions() -> usize {
+    2560
+}
+fn default_instruct() -> Option<String> {
+    Some(DEFAULT_QUERY_INSTRUCT.to_string())
+}
 
 impl EmbeddingConfig {
     /// 实际生效的查询侧指令文本。返回**空串**表示关闭 instruct 注入。
@@ -117,7 +146,9 @@ pub struct IndexConfig {
     pub reranker: RerankerConfig,
 }
 
-fn default_min_code_block_length() -> usize { 16 }
+fn default_min_code_block_length() -> usize {
+    16
+}
 
 /// 重排序配置（保留向后兼容）
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -130,18 +161,40 @@ pub struct RerankerConfig {
     pub api_token: String,
     #[serde(default = "default_api_base_url")]
     pub api_base_url: String,
+    /// cross-encoder 的 `top_n` **配置下界**（不再是硬性上限）。
+    ///
+    /// 旧语义是「最多只给 `top_n` 条候选打分」，导致最终预算大于该值时，前 `top_n` 条
+    /// 用 cross-encoder 分数、其余候选带着 RRF 分数被追加，最终名次混用两套分数体系。
+    ///
+    /// 现在的实际语义（见 `services/reranker_service.rs::derived_top_n`）：
+    /// `top_n = max(config.top_n, K_final)`，再被**可打分的文档数**夹住。
+    /// 因此它退化为一个向后兼容的下界：显式配大时仍会多打分，但最终名次全部来自
+    /// cross-encoder，不会被这个常量截断成两套分数混排。
     #[serde(default = "default_10")]
     pub top_n: usize,
+    /// 精排池放大倍数：`K_rerank = K_final × candidate_multiplier`（至少按 1 计）。
+    ///
+    /// 决定从 RRF 融合结果里取多少条送进 cross-encoder（受召回总数夹住）。
+    /// 配成 0 时按 1 处理 —— 精排池至少是最终预算大小，避免静默跳过精排。
+    /// 未启用 reranker 时该值不生效（`K_rerank` 收敛为 `K_final`）。
     #[serde(default = "default_5")]
     pub candidate_multiplier: usize,
     #[serde(default = "default_30")]
     pub timeout_secs: u64,
 }
 
-fn default_reranker_model() -> String { "BAAI/bge-reranker-v2-m3".to_string() }
-fn default_10() -> usize { 10 }
-fn default_5() -> usize { 5 }
-fn default_30() -> u64 { 30 }
+fn default_reranker_model() -> String {
+    "BAAI/bge-reranker-v2-m3".to_string()
+}
+fn default_10() -> usize {
+    10
+}
+fn default_5() -> usize {
+    5
+}
+fn default_30() -> u64 {
+    30
+}
 
 impl Default for IndexConfig {
     fn default() -> Self {
@@ -240,16 +293,15 @@ impl Config {
             return Err(format!(
                 "Config file not found at {:?}. Run 'codeseek' to set up.",
                 config_path
-            ).into());
+            )
+            .into());
         }
 
-        let contents = fs::read_to_string(&config_path).map_err(|e| {
-            format!("Failed to read config file at {:?}: {}", config_path, e)
-        })?;
+        let contents = fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config file at {:?}: {}", config_path, e))?;
 
-        let config: Config = serde_json::from_str(&contents).map_err(|e| {
-            format!("Failed to parse config file: {}", e)
-        })?;
+        let config: Config = serde_json::from_str(&contents)
+            .map_err(|e| format!("Failed to parse config file: {}", e))?;
 
         Ok(config)
     }
@@ -284,10 +336,11 @@ impl Config {
 
     /// 计算项目 hash
     pub fn compute_project_hash(project_root: &PathBuf) -> String {
-        format!("{:x}", md5::compute(project_root.to_string_lossy().as_bytes()))
+        format!(
+            "{:x}",
+            md5::compute(project_root.to_string_lossy().as_bytes())
+        )
     }
-
-
 }
 
 #[cfg(test)]
@@ -304,7 +357,8 @@ mod tests {
             "api_base_url": "https://api.siliconflow.cn/v1",
             "dimensions": 2560
         }"#;
-        let cfg: EmbeddingConfig = serde_json::from_str(json).expect("legacy config must deserialize");
+        let cfg: EmbeddingConfig =
+            serde_json::from_str(json).expect("legacy config must deserialize");
         assert_eq!(cfg.instruct.as_deref(), Some(DEFAULT_QUERY_INSTRUCT));
         assert_eq!(cfg.effective_instruct(), DEFAULT_QUERY_INSTRUCT);
     }
@@ -328,16 +382,21 @@ mod tests {
     /// 自定义指令：原样使用（首尾空白裁掉）。
     #[test]
     fn embedding_config_custom_instruct_is_used_verbatim_after_trim() {
-        let cfg: EmbeddingConfig =
-            serde_json::from_str(r#"{"instruct": "  Given a question, retrieve matching documents  "}"#)
-                .unwrap();
-        assert_eq!(cfg.effective_instruct(), "Given a question, retrieve matching documents");
+        let cfg: EmbeddingConfig = serde_json::from_str(
+            r#"{"instruct": "  Given a question, retrieve matching documents  "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.effective_instruct(),
+            "Given a question, retrieve matching documents"
+        );
     }
 
     /// 整个 embedding 段缺失（`Config` 上挂了 `#[serde(default)]`）→ 走 Default(None) → 仍是默认指令。
     #[test]
     fn config_without_embedding_section_falls_back_to_default_instruct() {
-        let cfg: Config = serde_json::from_str(r#"{}"#).expect("empty config object must deserialize");
+        let cfg: Config =
+            serde_json::from_str(r#"{}"#).expect("empty config object must deserialize");
         assert_eq!(cfg.embedding.instruct, None);
         assert_eq!(cfg.embedding.effective_instruct(), DEFAULT_QUERY_INSTRUCT);
         assert_eq!(DEFAULT_QUERY_INSTRUCT,

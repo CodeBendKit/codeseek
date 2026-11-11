@@ -5,8 +5,11 @@
 
 use crate::services::embedding_service::{EmbeddingService, SearchResult};
 use crate::services::reranker_service::RerankerService;
-use crate::storage::traits_bm25::{CandidateSource, CodeChunk, FusedCandidate, TextSearchProvider, TextSearchResult, parse_snippet_id};
-use anyhow::{Result, anyhow};
+use crate::storage::traits_bm25::{
+    parse_snippet_id, CandidateSource, CodeChunk, FusedCandidate, TextSearchProvider,
+    TextSearchResult,
+};
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -17,11 +20,18 @@ pub struct HybridSearchConfig {
     /// RRF fusion constant. Higher = ranks matter less.
     /// Industry standard is 60. See: https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
     pub rrf_k: f64,
-    /// Number of dense (vector) results to fetch per fusion query.
-    /// Should be >= top_k to ensure enough candidates for fusion.
+    /// Dense (vector) 通道的取回条数 —— 作为 `K_recall` 的**下界**。
+    ///
+    /// 实际取回条数由 [`SearchBudget`] 统一推导：
+    /// `K_recall = max(dense_limit, sparse_limit, K_rerank)`。
+    /// 因此本字段**不再**单独决定 RRF 融合后的保留条数（旧实现直接把
+    /// `max(dense_limit, sparse_limit)` 当作融合截断长度，当调用方的 `limit`
+    /// 大于该值时，融合结果会比最终预算还短）。调大它可以提升召回规模。
     pub dense_limit: usize,
-    /// Number of sparse (BM25) results to fetch per fusion query.
-    /// Should be >= top_k to ensure enough candidates for fusion.
+    /// Sparse (BM25) 通道的取回条数 —— 作为 `K_recall` 的**下界**。
+    ///
+    /// 与 [`Self::dense_limit`] 共同决定 `K_recall`（取两者与 `K_rerank` 的最大值），
+    /// 同样不再单独决定融合截断长度。
     pub sparse_limit: usize,
     /// Whether to enable the sparse (BM25) channel.
     /// When false, falls back to dense-only search.
@@ -29,7 +39,7 @@ pub struct HybridSearchConfig {
     /// Timeout for the entire hybrid search operation (milliseconds).
     /// 0 means no timeout.
     pub timeout_ms: u64,
-    /// Threshold (in chars) for short code penalty. 
+    /// Threshold (in chars) for short code penalty.
     /// Code blocks shorter than this get their score reduced.
     pub short_code_threshold: usize,
     /// Penalty strength for short code blocks (0.0 = no penalty, 1.0 = full penalty).
@@ -226,6 +236,78 @@ fn dense_snippet_id(sr: &SearchResult) -> String {
     CodeChunk::generate_id(&sr.file_path, sr.line_start, &sr.symbol_name)
 }
 
+/// 检索预算阶梯：保证 `k_recall >= k_rerank >= k_final`。
+///
+/// 旧实现里三档预算各自演算（融合用 `max(dense_limit, sparse_limit)`、精排池用
+/// `limit * candidate_multiplier`、reranker 内部 `top_n` 用配置常量），彼此没有约束，
+/// 于是出现「融合截断短于最终预算」「精排池小于最终预算」「最终名次混用 RRF 分数」
+/// 这些不一致。这里把三档一次性推导出来，其余位置只读这个结构。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchBudget {
+    /// 最终返回条数（调用方请求的 limit）
+    k_final: usize,
+    /// 送入 cross-encoder 的候选条数（reranker 未启用时收敛为 k_final）
+    k_rerank: usize,
+    /// 每个通道的取回条数、以及 RRF 融合后的保留条数
+    k_recall: usize,
+}
+
+impl SearchBudget {
+    fn new(
+        k_final: usize,
+        config: &HybridSearchConfig,
+        reranker: Option<&RerankerService>,
+    ) -> Self {
+        // 精排真正启用时才放大精排池；multiplier 至少按 1 计，避免配成 0 时池子被
+        // 压成 0 条（那等于静默跳过精排，却不给出任何提示）。
+        let multiplier = match reranker {
+            Some(r) if r.config().enabled => r.config().candidate_multiplier.max(1),
+            _ => 1,
+        };
+        // saturating_mul 防止 limit 极大时溢出
+        let k_rerank = k_final.saturating_mul(multiplier).max(k_final);
+        // 通道配置值是 K_recall 的下界：既保留原有召回规模，又保证不短于精排池
+        let k_recall = config.dense_limit.max(config.sparse_limit).max(k_rerank);
+        Self {
+            k_final,
+            k_rerank,
+            k_recall,
+        }
+    }
+}
+
+/// 用**完整原始候选集**把已排序结果补齐到 `k_final` 条。
+///
+/// 精排池只是召回集的前缀，池外尾部同样是合法候选；精排返回不足（正文缺失导致无
+/// 法打分、服务端漏返回、候选总数本就不足）时，按完整候选集的原顺序继续补，绝不
+/// 让最终结果短于「候选集本身能提供的条数」。按 `snippet_id` 去重，避免池内外重叠
+/// 造成重复条目。返回实际补齐的条数。
+fn fill_from_complete_set(
+    ranked: &mut Vec<FusedCandidate>,
+    complete: &[FusedCandidate],
+    k_final: usize,
+) -> usize {
+    if ranked.len() >= k_final {
+        return 0;
+    }
+
+    let mut seen: HashSet<String> = ranked.iter().map(|c| c.snippet_id.clone()).collect();
+    let mut filled = 0usize;
+
+    for candidate in complete {
+        if ranked.len() >= k_final {
+            break;
+        }
+        // insert 返回 false 表示该 snippet_id 已在结果里（池内已打分，或重复候选）
+        if seen.insert(candidate.snippet_id.clone()) {
+            ranked.push(candidate.clone());
+            filled += 1;
+        }
+    }
+
+    filled
+}
+
 impl HybridSearchService {
     /// Create a new hybrid search service without reranker.
     pub fn new(
@@ -233,7 +315,12 @@ impl HybridSearchService {
         sparse: Arc<dyn TextSearchProvider>,
         config: HybridSearchConfig,
     ) -> Self {
-        Self { dense, sparse, config, reranker: None }
+        Self {
+            dense,
+            sparse,
+            config,
+            reranker: None,
+        }
     }
 
     /// Create a new hybrid search service with optional reranker.
@@ -243,17 +330,35 @@ impl HybridSearchService {
         config: HybridSearchConfig,
         reranker: Option<RerankerService>,
     ) -> Self {
-        Self { dense, sparse, config, reranker }
+        Self {
+            dense,
+            sparse,
+            config,
+            reranker,
+        }
     }
 
     /// Execute hybrid search: query both channels, fuse results via RRF.
     ///
     /// # Arguments
     /// * `query` - The search query string
-    /// * `limit` - Number of final results to return
+    /// * `limit` - 最终返回条数（`K_final`）；`0` 直接返回空结果
     ///
     /// # Returns
     /// A vector of `FusedCandidate` sorted by fused RRF score (descending).
+    ///
+    /// # 检索预算阶梯（不变式：`K_recall >= K_rerank >= K_final`）
+    ///
+    /// 三档预算由 [`SearchBudget::new`] 一次性推导，其余位置只读该结构，不再各自演算：
+    ///
+    /// - `K_final` = 调用方传入的 `limit`：最终返回条数；
+    /// - `K_rerank` = `K_final × candidate_multiplier`（multiplier 至少按 1 计，reranker
+    ///   未启用时直接收敛为 `K_final`）：送入 cross-encoder 的候选池大小；
+    /// - `K_recall` = `max(dense_limit, sparse_limit, K_rerank)`：每个通道的取回条数，
+    ///   同时也是 RRF 融合后的保留条数（配置值只是它的下界）。
+    ///
+    /// 精排结果不足 `K_final` 时，补齐来源是**完整原始候选集**（而非仅精排池外的尾部），
+    /// 按 `snippet_id` 去重，见 [`fill_from_complete_set`]。
     ///
     /// 降级阶梯（两通道对称，任一条通道存活即出结果）：
     /// - dense 失败 + sparse 可用 → sparse-only 候选（`Self::sparse_only_candidates`）
@@ -272,13 +377,20 @@ impl HybridSearchService {
     /// 融合主路径同样先回填正文再进 reranker：`SparseOnly` 候选（以及缺正文的
     /// `Fused` 候选）在精排输入与最终证据里都必须是带正文的。
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<FusedCandidate>> {
-        if query.is_empty() {
+        if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
-        let dense_limit = self.config.dense_limit.max(limit);
+        // 三档预算一次性推导，后续只读 budget，不再各自演算
+        let budget = SearchBudget::new(limit, &self.config, self.reranker.as_ref());
+        debug!(
+            "Hybrid search budget: k_final={}, k_rerank={}, k_recall={}",
+            budget.k_final, budget.k_rerank, budget.k_recall
+        );
+
+        let dense_limit = budget.k_recall;
         let sparse_limit = if self.config.enable_sparse {
-            self.config.sparse_limit.max(limit)
+            budget.k_recall
         } else {
             0
         };
@@ -301,9 +413,8 @@ impl HybridSearchService {
         let mut fused: Vec<FusedCandidate> = match (dense_res, sparse_res_opt) {
             (Ok(dense), Some(Ok(sparse))) => {
                 debug!("Sparse channel returned {} results", sparse.len());
-                // Perform RRF fusion — 返回足够的候选供后续 rerank 使用
-                let rrf_limit = self.config.dense_limit.max(self.config.sparse_limit);
-                self.reciprocal_rank_fusion(dense, sparse, rrf_limit)
+                // Perform RRF fusion — 保留条数取 K_recall，保证不短于精排池与最终预算
+                self.reciprocal_rank_fusion(dense, sparse, budget.k_recall)
             }
             (Ok(dense), Some(Err(e))) => {
                 warn!(
@@ -312,12 +423,11 @@ impl HybridSearchService {
                 );
                 // 降级：不施加 RRF / 短代码惩罚，也不进 reranker。
                 // dense 候选的正文自带，无需 hydrate_code_blocks，降级语义保持不变。
-                return Ok(Self::dense_only_candidates(dense, limit));
+                return Ok(Self::dense_only_candidates(dense, budget.k_final));
             }
             (Ok(dense), None) => {
                 // sparse 被禁用：空 sparse 走 fusion，等价于融合后的 dense-only 排序
-                let rrf_limit = self.config.dense_limit.max(self.config.sparse_limit);
-                self.reciprocal_rank_fusion(dense, Vec::new(), rrf_limit)
+                self.reciprocal_rank_fusion(dense, Vec::new(), budget.k_recall)
             }
             (Err(dense_e), Some(Ok(sparse))) => {
                 warn!(
@@ -327,16 +437,17 @@ impl HybridSearchService {
                 // 降级：先用完整 BM25 池构造候选（上限取池长度，避免回填前就被 limit
                 // 截断），回填正文后再决定是否精排 —— 正文补上后「cross-encoder 无文本
                 // 可打分」这个原本跳过 reranker 的理由不再成立。
+                // 完整池同时是精排不足时唯一的补齐来源，因此这里不预先裁剪。
                 let pool_len = sparse.len();
-                let mut candidates = Self::sparse_only_candidates(sparse, pool_len.max(limit));
+                let mut candidates = Self::sparse_only_candidates(sparse, pool_len);
                 Self::hydrate_code_blocks(&mut candidates).await;
 
                 if let Some(ref reranker) = self.reranker {
                     if reranker.config().enabled {
-                        return self.apply_rerank(reranker, query, candidates, limit).await;
+                        return self.apply_rerank(reranker, query, candidates, budget).await;
                     }
                 }
-                candidates.truncate(limit);
+                candidates.truncate(budget.k_final);
                 return Ok(candidates);
             }
             (Err(dense_e), Some(Err(sparse_e))) => {
@@ -356,7 +467,10 @@ impl HybridSearchService {
             }
         };
 
-        debug!("Hybrid search returned {} fused candidates (before rerank)", fused.len());
+        debug!(
+            "Hybrid search returned {} fused candidates (before rerank)",
+            fused.len()
+        );
 
         // BM25 通道的 content 非 STORED，`SparseOnly` 候选天然没有正文：进 reranker 前
         // 必须先在磁盘上补齐，否则 cross-encoder 收到空 document、最终证据也是空的
@@ -365,13 +479,13 @@ impl HybridSearchService {
         // Phase 2: Optional Cross-Encoder Rerank
         if let Some(ref reranker) = self.reranker {
             if reranker.config().enabled {
-                return self.apply_rerank(reranker, query, fused, limit).await;
+                return self.apply_rerank(reranker, query, fused, budget).await;
             }
         }
 
-        // 无 rerank 时截断到 limit
+        // 无 rerank 时截断到最终预算
         let mut result = fused;
-        result.truncate(limit);
+        result.truncate(budget.k_final);
         Ok(result)
     }
 
@@ -551,7 +665,10 @@ impl HybridSearchService {
             // 只记录非 0 行号，同 (file, symbol) 取第一次出现的值
             if sparse_meta.line_start > 0 {
                 sparse_line_by_symbol
-                    .entry((sparse_meta.file_path.clone(), sparse_meta.symbol_name.clone()))
+                    .entry((
+                        sparse_meta.file_path.clone(),
+                        sparse_meta.symbol_name.clone(),
+                    ))
                     .or_insert(sparse_meta.line_start);
             }
 
@@ -571,8 +688,11 @@ impl HybridSearchService {
                     dense_meta.line_start = *line;
                 }
             }
-            let snippet_id =
-                CodeChunk::generate_id(&dense_meta.file_path, dense_meta.line_start, &dense_meta.symbol_name);
+            let snippet_id = CodeChunk::generate_id(
+                &dense_meta.file_path,
+                dense_meta.line_start,
+                &dense_meta.symbol_name,
+            );
 
             let rrf_score = 1.0 / (k + rank as f64 + 1.0);
             *score_map.entry(snippet_id.clone()).or_insert(0.0) += rrf_score;
@@ -624,7 +744,7 @@ impl HybridSearchService {
                         fused_score
                     }
                 };
-                
+
                 Some(FusedCandidate {
                     snippet_id,
                     final_score,
@@ -645,36 +765,58 @@ impl HybridSearchService {
         &self.config
     }
 
-    /// 对 RRF 融合结果执行 Cross-Encoder 重排
+    /// 对 RRF 融合结果执行 Cross-Encoder 重排，并保证最终结果满足检索预算阶梯。
+    ///
+    /// # 不变式
+    /// `K_recall >= K_rerank >= K_final`（见 [`SearchBudget`]）：
+    /// - 精排池大小 = `min(K_rerank, fused.len())`，因此池子**至少**有
+    ///   `min(K_final, fused.len())` 条 —— 旧实现用 `limit * candidate_multiplier`
+    ///   且不设下限，`candidate_multiplier = 0` 时池子为 0，精排被静默跳过；
+    /// - 精排排序 key 是 cross-encoder 分数，池外候选用的是 RRF 分数，两套分数不混排：
+    ///   池外候选只可能在「池内可打分候选不足 `K_final`」时被追加。
+    ///
+    /// # 补齐语义
+    /// 补齐来源是**完整原始候选集 `fused`**（而不是仅精排池外的尾部）：精排池只是召回集的
+    /// 前缀，池外尾部同样是合法候选，某个池内候选因缺正文而无法打分时，真正该补上来的
+    /// 可能是池外的靠前条目。补齐按 `snippet_id` 去重，见 [`fill_from_complete_set`]。
     async fn apply_rerank(
         &self,
         reranker: &RerankerService,
         query: &str,
         fused: Vec<FusedCandidate>,
-        limit: usize,
+        budget: SearchBudget,
     ) -> Result<Vec<FusedCandidate>> {
-        // 取 RRF 候选池（limit * candidate_multiplier），但不超过 fused 总长度
-        let pool_size = (limit * reranker.config().candidate_multiplier).min(fused.len());
-        let (candidate_pool, remaining) = fused.split_at(pool_size);
+        // 池大小 >= min(k_final, fused.len())，且不超过候选总数
+        let pool_size = budget.k_rerank.min(fused.len());
+        let pool: Vec<FusedCandidate> = fused[..pool_size].to_vec();
 
-        debug!("Reranker: sending {} candidates (limit={}, multiplier={})", 
-            pool_size, limit, reranker.config().candidate_multiplier);
+        debug!(
+            "Reranker: sending {} candidates (k_final={}, k_rerank={}, k_recall={}, candidates={}, multiplier={})",
+            pool_size,
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall,
+            fused.len(),
+            reranker.config().candidate_multiplier
+        );
 
-        match reranker.rerank(query, candidate_pool.to_vec()).await {
+        match reranker.rerank(query, pool, budget.k_final).await {
             Ok(mut reranked) => {
-                // 重排结果只取 top limit
-                reranked.truncate(limit);
-                
-                // 如果重排结果不足 limit，用剩余的 RRF 候选填充
-                if reranked.len() < limit {
-                    let need = limit - reranked.len();
-                    reranked.extend(
-                        remaining.iter()
-                            .take(need)
-                            .cloned()
+                // 重排结果只取最终预算
+                reranked.truncate(budget.k_final);
+
+                // 精排不足时从完整原始候选集补齐（池外尾部也是补齐来源）
+                let filled = fill_from_complete_set(&mut reranked, &fused, budget.k_final);
+                if filled > 0 {
+                    debug!(
+                        "Reranker: 从完整原始候选集补齐 {} 条（池 {} / 召回 {} / 目标 {}）",
+                        filled,
+                        pool_size,
+                        fused.len(),
+                        budget.k_final
                     );
                 }
-                
+
                 debug!("Reranker: final {} results after rerank", reranked.len());
                 Ok(reranked)
             }
@@ -682,7 +824,7 @@ impl HybridSearchService {
                 // 降级：返回 RRF 结果
                 warn!("Reranker failed, falling back to RRF results: {}", e);
                 let mut fallback = fused;
-                fallback.truncate(limit);
+                fallback.truncate(budget.k_final);
                 Ok(fallback)
             }
         }
@@ -692,11 +834,17 @@ impl HybridSearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RerankerConfig;
 
     /// 60+ chars — 超过 default 的 short_code_threshold(30)，避免惩罚干扰断言
     const CODE_BLOCK: &str = "fn foo() {\n    let mut v = Vec::new();\n    v.push(1);\n    v\n}\n";
 
-    fn make_dense(file_path: &str, symbol: &str, line_start: usize, line_end: usize) -> SearchResult {
+    fn make_dense(
+        file_path: &str,
+        symbol: &str,
+        line_start: usize,
+        line_end: usize,
+    ) -> SearchResult {
         SearchResult {
             file_path: file_path.to_string(),
             symbol_name: symbol.to_string(),
@@ -709,7 +857,12 @@ mod tests {
         }
     }
 
-    fn make_sparse(snippet_id: &str, file_path: &str, symbol: &str, line_start: usize) -> TextSearchResult {
+    fn make_sparse(
+        snippet_id: &str,
+        file_path: &str,
+        symbol: &str,
+        line_start: usize,
+    ) -> TextSearchResult {
         TextSearchResult {
             snippet_id: snippet_id.to_string(),
             score: 3.5,
@@ -775,14 +928,21 @@ mod tests {
 
         let fused = HybridSearchService::fuse(dense, sparse, &config, 10);
 
-        assert_eq!(fused.len(), 1, "回填行号并重算 id 后，两侧必须合并为一条候选");
+        assert_eq!(
+            fused.len(),
+            1,
+            "回填行号并重算 id 后，两侧必须合并为一条候选"
+        );
         let c = &fused[0];
         assert_eq!(c.snippet_id, id);
         assert_eq!(c.source, CandidateSource::Fused);
         assert_eq!(c.line_start, 10, "dense 缺失的行号应从 sparse 回填");
         assert_eq!(c.line_end, 0);
         let expected = 1.0 / (config.rrf_k + 1.0) + 1.0 / (config.rrf_k + 1.0);
-        assert!((c.final_score - expected).abs() < 1e-9, "两通道 RRF 分数应累加");
+        assert!(
+            (c.final_score - expected).abs() < 1e-9,
+            "两通道 RRF 分数应累加"
+        );
         assert!(!c.code_block.is_empty(), "正文应由 dense 通道补齐");
     }
 
@@ -842,7 +1002,10 @@ mod tests {
         assert_eq!(c.line_start, 10, "行号应从 snippet_id 反解得到");
         assert_eq!(c.line_end, 0, "BM25 通道没有结束行");
         assert!(c.code_block.is_empty(), "BM25 通道不存储正文");
-        assert_eq!(c.final_score, expected_score as f64, "降级不施加 RRF，分数原样保留");
+        assert_eq!(
+            c.final_score, expected_score as f64,
+            "降级不施加 RRF，分数原样保留"
+        );
     }
 
     #[test]
@@ -857,8 +1020,14 @@ mod tests {
         let candidates = HybridSearchService::dense_only_candidates(dense, 2);
 
         assert_eq!(candidates.len(), 2, "降级路径必须按 limit 截断");
-        assert_eq!(candidates[0].snippet_id, CodeChunk::generate_id("/tmp/a.rs", 1, "foo"));
-        assert_eq!(candidates[1].snippet_id, CodeChunk::generate_id("/tmp/b.rs", 11, "bar"));
+        assert_eq!(
+            candidates[0].snippet_id,
+            CodeChunk::generate_id("/tmp/a.rs", 1, "foo")
+        );
+        assert_eq!(
+            candidates[1].snippet_id,
+            CodeChunk::generate_id("/tmp/b.rs", 11, "bar")
+        );
         for c in &candidates {
             assert_eq!(c.source, CandidateSource::DenseOnly);
             assert!(!c.code_block.is_empty(), "正文应由 dense 通道自带");
@@ -870,12 +1039,22 @@ mod tests {
     fn sparse_only_candidates_preserves_input_rank_order() {
         // 降级路径不重排：BM25 通道自身已按相关性排序，输出顺序必须一致
         let high = {
-            let mut s = make_sparse(&CodeChunk::generate_id("/tmp/a.rs", 1, "high"), "/tmp/a.rs", "high", 1);
+            let mut s = make_sparse(
+                &CodeChunk::generate_id("/tmp/a.rs", 1, "high"),
+                "/tmp/a.rs",
+                "high",
+                1,
+            );
             s.score = 8.0;
             s
         };
         let low = {
-            let mut s = make_sparse(&CodeChunk::generate_id("/tmp/b.rs", 5, "low"), "/tmp/b.rs", "low", 5);
+            let mut s = make_sparse(
+                &CodeChunk::generate_id("/tmp/b.rs", 5, "low"),
+                "/tmp/b.rs",
+                "low",
+                5,
+            );
             s.score = 2.0;
             s
         };
@@ -1076,5 +1255,170 @@ mod tests {
         );
         assert!(fused[0].code_block.contains("do_something()"));
         assert!(fused[0].line_end > 0);
+    }
+
+    // ---- SearchBudget ----------------------------------------------------
+
+    /// 构造一个「启用精排」的 RerankerService；不发起任何 HTTP 调用。
+    fn enabled_reranker(candidate_multiplier: usize) -> RerankerService {
+        RerankerService::new(RerankerConfig {
+            enabled: true,
+            candidate_multiplier,
+            ..Default::default()
+        })
+    }
+
+    fn candidate_with_id(id: &str) -> FusedCandidate {
+        FusedCandidate {
+            snippet_id: id.to_string(),
+            final_score: 0.5,
+            file_path: format!("/tmp/{}.rs", id),
+            symbol_name: "sym".to_string(),
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 2,
+            code_block: "fn f() {}".to_string(),
+            source: CandidateSource::SparseOnly,
+        }
+    }
+
+    fn ids(candidates: &[FusedCandidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.snippet_id.as_str()).collect()
+    }
+
+    #[test]
+    fn search_budget_keeps_recall_rerank_final_ordering() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(5);
+
+        let budget = SearchBudget::new(10, &config, Some(&reranker));
+
+        // 10 (K_final) <= 50 (K_rerank) <= 100 (K_recall)
+        assert_eq!(budget.k_final, 10);
+        assert_eq!(budget.k_rerank, 50, "K_rerank = K_final × multiplier");
+        assert_eq!(
+            budget.k_recall, 100,
+            "K_recall 取 max(dense_limit, sparse_limit, K_rerank)"
+        );
+        assert!(
+            budget.k_final <= budget.k_rerank && budget.k_rerank <= budget.k_recall,
+            "阶梯必须成立：{} <= {} <= {}",
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall
+        );
+    }
+
+    #[test]
+    fn search_budget_clamps_multiplier_zero() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(0);
+
+        let budget = SearchBudget::new(10, &config, Some(&reranker));
+
+        assert_eq!(
+            budget.k_rerank, budget.k_final,
+            "multiplier 配成 0 时按 1 处理，精排池不得被压成 0"
+        );
+        assert!(
+            budget.k_final <= budget.k_rerank && budget.k_rerank <= budget.k_recall,
+            "阶梯必须成立：{} <= {} <= {}",
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall
+        );
+    }
+
+    #[test]
+    fn search_budget_without_reranker_collapses_to_final() {
+        let config = HybridSearchConfig::default();
+
+        let budget = SearchBudget::new(10, &config, None);
+
+        assert_eq!(
+            budget.k_rerank, budget.k_final,
+            "未启用精排时 K_rerank 收敛为 K_final"
+        );
+        assert_eq!(
+            budget.k_recall,
+            config
+                .dense_limit
+                .max(config.sparse_limit)
+                .max(budget.k_final),
+            "K_recall 是配置值与 K_final 的最大值"
+        );
+    }
+
+    #[test]
+    fn search_budget_grows_with_large_limit() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(5);
+
+        let budget = SearchBudget::new(500, &config, Some(&reranker));
+
+        assert_eq!(
+            budget.k_rerank, 2500,
+            "大 limit 时精排预算应同步放大，不被 config 的 100 卡住"
+        );
+        assert_eq!(budget.k_recall, 2500, "召回预算必须跟上升级后的精排池");
+        assert!(budget.k_recall >= budget.k_rerank && budget.k_rerank >= budget.k_final);
+    }
+
+    // ---- fill_from_complete_set -----------------------------------------
+
+    #[test]
+    fn fill_from_complete_set_dedupes_and_appends_in_order() {
+        let complete = vec![
+            candidate_with_id("A"),
+            candidate_with_id("B"),
+            candidate_with_id("C"),
+            candidate_with_id("D"),
+        ];
+        let mut ranked = vec![candidate_with_id("A")];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 3);
+
+        assert_eq!(filled, 2, "只补到 k_final 为止");
+        assert_eq!(
+            ids(&ranked),
+            vec!["A", "B", "C"],
+            "按 complete 原顺序补齐且去重"
+        );
+    }
+
+    #[test]
+    fn fill_from_complete_set_noop_when_enough() {
+        let complete = vec![candidate_with_id("A"), candidate_with_id("B")];
+        let mut ranked = vec![candidate_with_id("X"), candidate_with_id("Y")];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 2);
+
+        assert_eq!(filled, 0);
+        assert_eq!(ids(&ranked), vec!["X", "Y"], "已满足预算时顺序不得改变");
+    }
+
+    #[test]
+    fn fill_from_complete_set_backfills_beyond_rerank_pool() {
+        // complete 5 条；ranked 只有前 2 条，其中一条与 complete[2] 重复
+        let complete: Vec<FusedCandidate> = (0..5)
+            .map(|i| candidate_with_id(&format!("c{}", i)))
+            .collect();
+        let mut ranked = vec![complete[0].clone(), complete[2].clone()];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 4);
+
+        assert_eq!(filled, 2);
+        assert_eq!(ranked.len(), 4, "必须补齐到 k_final");
+        let mut unique: Vec<&str> = ids(&ranked);
+        let total = unique.len();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), total, "补齐不得产生重复 snippet_id");
+        // 补进来的是 complete 里最靠前、且尚未出现的两条（c1、c3），而不是池外尾部
+        assert_eq!(ids(&ranked), vec!["c0", "c2", "c1", "c3"]);
+        assert!(
+            !ids(&ranked).contains(&"c4"),
+            "补到 k_final 即停，不应越过预算"
+        );
     }
 }
