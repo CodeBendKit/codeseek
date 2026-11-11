@@ -357,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         timeout_ms: 0,
                                         short_code_threshold: hybrid_cfg.short_code_threshold,
                                         short_code_penalty: hybrid_cfg.short_code_penalty,
+                                        cutoff: hybrid_cfg.cutoff.clone(),
                                     },
                                     Some(reranker),
                                 )
@@ -372,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         timeout_ms: 0,
                                         short_code_threshold: hybrid_cfg.short_code_threshold,
                                         short_code_penalty: hybrid_cfg.short_code_penalty,
+                                        cutoff: hybrid_cfg.cutoff.clone(),
                                     },
                                 )
                             };

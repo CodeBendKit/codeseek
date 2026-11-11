@@ -1,3 +1,4 @@
+use crate::services::hybrid_search::AdaptiveCutoffConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -28,6 +29,13 @@ pub struct HybridSearchConfig {
     pub short_code_threshold: usize,
     #[serde(default = "default_short_code_penalty")]
     pub short_code_penalty: f64,
+    /// 自适应 cutoff —— 直接映射到 `services::HybridSearchConfig.cutoff`。
+    ///
+    /// 字段级 `#[serde(default)]` + 类型级 `#[serde(default)]`（见
+    /// [`AdaptiveCutoffConfig`]）：旧 config.json 缺少 `cutoff` 整段、或只写了其中
+    /// 几个子字段时都能正常反序列化，缺失部分回落到 `AdaptiveCutoffConfig::default()`。
+    #[serde(default)]
+    pub cutoff: AdaptiveCutoffConfig,
 }
 
 fn default_true() -> bool {
@@ -59,6 +67,7 @@ impl Default for HybridSearchConfig {
             rrf_top_k: default_20(),
             short_code_threshold: default_short_code_threshold(),
             short_code_penalty: default_short_code_penalty(),
+            cutoff: AdaptiveCutoffConfig::default(),
         }
     }
 }

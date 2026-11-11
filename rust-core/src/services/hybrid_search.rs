@@ -14,6 +14,67 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+/// 自适应 cutoff 配置 —— 在**分数域归一化**之后执行的「三闸门级联截断」参数。
+///
+/// 为什么必须先归一化：`FusedCandidate::final_score` 在四条产出路径上分属四个完全
+/// 不同的分数域（RRF 融合分、向量相似度、BM25 原始分、cross-encoder 概率），绝对值
+/// 互相不可比。因此本配置的所有阈值都作用在 [`ScoreDomain::to_relevance`] 归一化后的
+/// `rel ∈ [0, 1]` 上；`final_score` 字段本身**永不被改写**（调用方会打印它，JSON 也
+/// 会原样透传）。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct AdaptiveCutoffConfig {
+    /// 总开关。`false` 时退化为「仅按 `k_final` 截断」的旧行为（`trigger = Disabled`）。
+    ///
+    /// 排查「结果莫名变少」时先关它：这是唯一一键回到旧行为的旋钮。
+    pub enabled: bool,
+    /// 闸门一：绝对下限（硬闸）。归一化分数 `rel <= abs_floor` 的候选**及其后所有
+    /// 候选**一律丢弃 —— 语义是「这些条目与查询的相关度低于可用门槛」。
+    ///
+    /// 取值域 `[0, 1]`，用**严格大于**判定通过（`rel == 0.2` 配 `abs_floor = 0.2` 会被
+    /// 丢弃）。调大：更激进，可能直接返回 0 条；调小：更保守，几乎不靠它裁剪。
+    /// 它是三闸门中唯一的硬闸：`min_keep` 也不能突破它。
+    pub abs_floor: f64,
+    /// 闸门二：相对比例（连续域与 dense 降级域使用）。只保留
+    /// `rel >= rel_ratio × rel[0]` 的前缀，即「允许的最大相对落差」。
+    ///
+    /// 取值域 `[0, 1]`（实现侧再 `clamp` 一次）；1.0 等价于「只留与 top1 同分者」。
+    /// 调大：容忍更多尾部；调小：只保留贴近头部的条目。
+    pub rel_ratio: f64,
+    /// 闸门二在 **RRF 域**使用的相对比例。
+    ///
+    /// RRF 分数是离散档位（双通道 `2/(rrf_k+1)`、单通道 `1/(rrf_k+1)`），双通道与
+    /// 单通道之相对落差恒为 0.5，因此本默认值（0.40）必须**低于 0.5**，否则所有单通道
+    /// 命中都会被一刀砍掉。取值域 `[0, 1]`；调大超过 0.5 即开始丢单通道命中。
+    pub rel_ratio_rrf: f64,
+    /// 闸门三：断层检测阈值（**仅连续分数域**）。相邻两项的相对跌幅
+    /// `(rel[i] - rel[i+1]) / rel[i] >= gap_min` 视为「断层」，并截断在断层之前。
+    ///
+    /// 取值域 `[0, 1]`。调大：只有陡峭断崖才触发（结果更少被裁）；调小：轻微落差
+    /// 即视为断层（结果更容易被砍）。RRF 域**完全跳过**本闸门，原因见
+    /// [`adaptive_cutoff`] 内的注释。
+    pub gap_min: f64,
+    /// 保底条数：裁剪后至少保留这么多条，但受闸门一硬上限约束，即
+    /// `final_len = max(闸门结果, min_keep.min(len_abs))`。0 表示不保底。
+    ///
+    /// 调大：结果更「宽」，但可能带回被比例/断层闸门判定为不相关的条目；
+    /// 调小：更严格，允许只返回 1 条甚至 0 条。
+    pub min_keep: usize,
+}
+
+impl Default for AdaptiveCutoffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            abs_floor: 0.2,
+            rel_ratio: 0.55,
+            rel_ratio_rrf: 0.40,
+            gap_min: 0.30,
+            min_keep: 1,
+        }
+    }
+}
+
 /// Configuration for hybrid search behavior.
 #[derive(Debug, Clone)]
 pub struct HybridSearchConfig {
@@ -45,6 +106,11 @@ pub struct HybridSearchConfig {
     /// Penalty strength for short code blocks (0.0 = no penalty, 1.0 = full penalty).
     /// Applied as: penalty = 1.0 - max(0, 1 - len/threshold) * strength
     pub short_code_penalty: f64,
+    /// 自适应 cutoff（分数域归一化后的三闸门级联截断）参数。
+    ///
+    /// 与 RRF 融合公式、[`SearchBudget`] 预算阶梯彼此正交：它只在预算截断**之后**
+    /// 决定「这批结果里到底有几条真的值得返回」。详见 [`AdaptiveCutoffConfig`]。
+    pub cutoff: AdaptiveCutoffConfig,
 }
 
 impl Default for HybridSearchConfig {
@@ -57,6 +123,7 @@ impl Default for HybridSearchConfig {
             timeout_ms: 0,
             short_code_threshold: 30,
             short_code_penalty: 0.5,
+            cutoff: AdaptiveCutoffConfig::default(),
         }
     }
 }
@@ -308,6 +375,304 @@ fn fill_from_complete_set(
     filled
 }
 
+/// `final_score` 所属的分数域 —— 归一化到 `rel ∈ [0, 1]` 的唯一入口。
+///
+/// [`HybridSearchService::search`] 有 4 条产出路径，四者的 `final_score` 量纲完全不同，
+/// **绝对阈值绝不能直接打在 `final_score` 上**：
+///
+/// | 路径 | 分数 | 典型量级 |
+/// |---|---|---|
+/// | 主路径 RRF 融合 | `Σ 1/(rrf_k + rank + 1)` | 单通道 ≈0.0164、双通道 ≈0.0328 |
+/// | Reranker 池内命中 | cross-encoder sigmoid 概率 | ≈[0, 1] |
+/// | dense-only 降级 | `1/(1+distance)` | ≈[0, 1] |
+/// | sparse-only 降级 | BM25 原始分 | 无上界 |
+#[derive(Debug, Clone, Copy)]
+enum ScoreDomain {
+    /// RRF 融合域。`max_possible = channels / (rrf_k + 1)`，其中 `channels` 是**实际参与
+    /// 融合且有非空结果**的通道数（至少取 1），故双通道 top1 归一化为 1.0、单通道
+    /// top1 归一化为 0.5。
+    Rrf { max_possible: f64 },
+    /// dense-only 降级域（`1/(1+distance)`，本身已在 [0, 1] 附近）。
+    DenseSim,
+    /// sparse-only 降级域。`top` 为该候选列表首条（最高）BM25 原始分，用作归一化分母。
+    Bm25Raw { top: f64 },
+    /// cross-encoder 概率域（sigmoid 输出，已在 [0, 1]）。
+    Rerank,
+}
+
+impl ScoreDomain {
+    /// 域名称，仅用于日志。
+    fn name(&self) -> &'static str {
+        match self {
+            ScoreDomain::Rrf { .. } => "Rrf",
+            ScoreDomain::DenseSim => "DenseSim",
+            ScoreDomain::Bm25Raw { .. } => "Bm25Raw",
+            ScoreDomain::Rerank => "Rerank",
+        }
+    }
+
+    /// 把本域的原始分数映射到可比较的 `rel ∈ [0, 1]`。
+    ///
+    /// 非有限输入（`NaN` / `±Inf`）一律返回 `0.0`，并由调用侧（[`adaptive_cutoff`]）
+    /// 汇总 warn 一次 —— 这样脏分数只会被「丢弃」，不会污染排序也不会 panic。
+    fn to_relevance(self, score: f64) -> f64 {
+        if !score.is_finite() {
+            return 0.0;
+        }
+        match self {
+            // max_possible 由调用方保证 > 0；这里仍做一次防御，避免除以 0 得到 inf
+            ScoreDomain::Rrf { max_possible } => {
+                if max_possible > 0.0 {
+                    (score / max_possible).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            ScoreDomain::DenseSim | ScoreDomain::Rerank => score.clamp(0.0, 1.0),
+            // BM25 原始分无上界：以本批最高分为分母做 min-max 上界归一化
+            ScoreDomain::Bm25Raw { top } => {
+                if top > 0.0 {
+                    (score / top).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+/// 自适应 cutoff 的触发者（哪道闸门决定了最终长度）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CutoffTrigger {
+    /// 未被任何闸门裁剪（或裁剪后长度仍等于有效长度）。
+    #[default]
+    None,
+    /// 闸门一：绝对下限（硬闸）
+    AbsoluteFloor,
+    /// 闸门二：相对比例
+    RelativeRatio,
+    /// 闸门三：断层检测
+    ScoreGap,
+    /// 配置关闭，仅按 `k_final` 截断
+    Disabled,
+}
+
+/// 一次自适应 cutoff 的观测报告（仅用于日志与单测断言）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CutoffReport {
+    /// 施加前条数
+    before: usize,
+    /// 施加后条数
+    after: usize,
+    /// 实际生效的闸门
+    trigger: CutoffTrigger,
+    /// 闸门一通过的前缀长度
+    len_abs: usize,
+    /// 闸门二通过的前缀长度
+    len_ratio: usize,
+    /// 闸门三通过的前缀长度
+    len_gap: usize,
+}
+
+/// 自适应 cutoff：分数域归一化 + 三闸门级联前缀截断。
+///
+/// 纯函数（不依赖 `self`），便于单测。**只做前缀截断**，绝不中间挖洞；`final_score`
+/// 字段本身不被改写，归一化只作用于内部的 `rel` 向量。
+///
+/// 三闸门的硬/软语义：
+/// - 闸门一（[`AdaptiveCutoffConfig::abs_floor`]）是**硬闸**：`rel <= abs_floor` 即截断，
+///   且它同时限制 `min_keep` 的保底上限；
+/// - 闸门二（`rel_ratio` / `rel_ratio_rrf`）是**软闸**：只与头部分数比较相对落差；
+/// - 闸门三（`gap_min`）是**软闸**：只看相邻项的相对跌幅，识别「断崖」。
+///
+/// 顺序是 `绝对下限 → 相对比例 → 断层检测 → 保底`：先剔除「根本不合格」的尾部，再比较
+/// 相对落差，最后才做断崖识别，这样后两者永远只在闸门一允许的前缀内工作。
+fn adaptive_cutoff(
+    candidates: &mut Vec<FusedCandidate>,
+    domain: ScoreDomain,
+    cfg: &AdaptiveCutoffConfig,
+    k_final: usize,
+) -> CutoffReport {
+    let before = candidates.len();
+
+    // ---- Step 0：早退 ----
+    if candidates.is_empty() {
+        return CutoffReport {
+            before: 0,
+            after: 0,
+            trigger: CutoffTrigger::None,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+    if !cfg.enabled {
+        candidates.truncate(k_final);
+        let after = candidates.len();
+        debug!(
+            "自适应 cutoff 已关闭：{} → {} 条（仅按 k_final={} 截断）",
+            before, after, k_final
+        );
+        return CutoffReport {
+            before,
+            after,
+            trigger: CutoffTrigger::Disabled,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+
+    // ---- Step 1：计算 rel（归一化后的可比分数） ----
+    let mut non_finite = 0usize;
+    let rel: Vec<f64> = candidates
+        .iter()
+        .map(|c| {
+            if !c.final_score.is_finite() {
+                non_finite += 1;
+            }
+            domain.to_relevance(c.final_score)
+        })
+        .collect();
+    if non_finite > 0 {
+        warn!(
+            "自适应 cutoff：{} 域有 {} 条候选分数非有限（NaN/Inf），按 rel=0 处理",
+            domain.name(),
+            non_finite
+        );
+    }
+
+    // ---- Step 2：按 rel 稳定降序重排 ----
+    // 必须重排：`apply_rerank` 成功分支先 truncate 再 fill_from_complete_set，补进来的
+    // 未打分 RRF 候选被追加到末尾，其 final_score（最高 2/(k+1)）可能大于池内某些
+    // rerank 低分，于是返回 Vec 并非严格降序。前缀截断算法必须建立在单调序列上。
+    // 用 std::mem::take 搬移而非 clone；sort_by 是稳定排序。
+    let taken = std::mem::take(candidates);
+    let mut paired: Vec<(f64, FusedCandidate)> = rel.into_iter().zip(taken).collect();
+    paired.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ---- Step 3：有效长度（永不超过最终预算） ----
+    let n = paired.len().min(k_final);
+
+    // ---- Step 4：闸门一 —— 绝对下限（硬闸，严格大于才通过） ----
+    // 用 `>` 而非 `>=`：用户示例 [0.85, 0.81, 0.7, 0.2] 中 0.2 必须被丢掉。
+    let mut len_abs = 0usize;
+    for (i, (rel, _)) in paired.iter().enumerate().take(n) {
+        if *rel > cfg.abs_floor {
+            len_abs = i + 1;
+        } else {
+            break;
+        }
+    }
+    if len_abs == 0 {
+        // candidates 已被 mem::take 掏空，直接返回即「清空」语义
+        debug!(
+            "自适应 cutoff：{} 域全部 {} 条候选 rel <= abs_floor={}，结果清空",
+            domain.name(),
+            before,
+            cfg.abs_floor
+        );
+        return CutoffReport {
+            before,
+            after: 0,
+            trigger: CutoffTrigger::AbsoluteFloor,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+
+    // ---- Step 5：闸门二 —— 相对比例（软闸） ----
+    // RRF 域用独立的 rel_ratio_rrf：RRF 只有离散档位，用连续域比例会误伤单通道命中。
+    let ratio = match domain {
+        ScoreDomain::Rrf { .. } => cfg.rel_ratio_rrf,
+        _ => cfg.rel_ratio,
+    }
+    .clamp(0.0, 1.0);
+    let bound = ratio * paired[0].0;
+    let mut len_ratio = 0usize;
+    for (i, (rel, _)) in paired.iter().enumerate().take(len_abs) {
+        if *rel >= bound {
+            len_ratio = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // ---- Step 6：闸门三 —— 断层检测（软闸，仅连续分数域） ----
+    // RRF 域**完全跳过**：RRF 分数是离散档位（双通道归一化后 1.0、单通道 0.5），
+    // 相邻档位的相对跌幅恒为 0.5，只要 gap_min < 0.5 就会在「双通道 → 单通道」边界
+    // 上触发，退化成「砍掉所有单通道命中」—— 这是错误语义，而非「断崖」。因此
+    // RRF 域把 len_gap 直接设为 len_ratio。
+    let mut len_gap = len_ratio;
+    let mut gap_hit = false;
+    if !matches!(domain, ScoreDomain::Rrf { .. }) {
+        for i in 0..len_ratio {
+            if i + 1 >= len_ratio {
+                break;
+            }
+            let cur = paired[i].0;
+            let next = paired[i + 1].0;
+            if cur > 0.0 && (cur - next) / cur >= cfg.gap_min {
+                len_gap = i + 1;
+                gap_hit = true;
+                break;
+            }
+        }
+    }
+
+    // ---- Step 7：保底与收尾 ----
+    // 保底上限被闸门一钳住：min_keep 再大也绝不突破绝对下限这道硬闸。
+    let final_len = len_gap.max(cfg.min_keep.min(len_abs));
+    let mut trigger = CutoffTrigger::None;
+    if len_abs < n {
+        trigger = CutoffTrigger::AbsoluteFloor;
+    }
+    if len_ratio < n && len_ratio < len_abs {
+        trigger = CutoffTrigger::RelativeRatio;
+    }
+    if gap_hit {
+        trigger = CutoffTrigger::ScoreGap;
+    }
+    if final_len >= n {
+        // 长度最终没有被压到有效长度以下（含 min_keep 抬回的情形）⇒ 视为未裁剪
+        trigger = CutoffTrigger::None;
+    }
+
+    let dropped = if final_len < paired.len() {
+        // 降序序列：丢弃区间是 paired[final_len..]，首为其中最大、尾为最小
+        (paired[final_len].0, paired[paired.len() - 1].0)
+    } else {
+        (0.0, 0.0)
+    };
+
+    paired.truncate(final_len);
+    *candidates = paired.into_iter().map(|(_, c)| c).collect();
+    let after = candidates.len();
+
+    debug!(
+        "自适应 cutoff：{} 域 {} → {} 条（trigger={:?}, abs={}, ratio={}, gap={}, 丢弃 rel 区间 [{:.4}, {:.4}]）",
+        domain.name(),
+        before,
+        after,
+        trigger,
+        len_abs,
+        len_ratio,
+        len_gap,
+        dropped.0,
+        dropped.1
+    );
+
+    CutoffReport {
+        before,
+        after,
+        trigger,
+        len_abs,
+        len_ratio,
+        len_gap,
+    }
+}
+
 impl HybridSearchService {
     /// Create a new hybrid search service without reranker.
     pub fn new(
@@ -376,6 +741,37 @@ impl HybridSearchService {
     ///
     /// 融合主路径同样先回填正文再进 reranker：`SparseOnly` 候选（以及缺正文的
     /// `Fused` 候选）在精排输入与最终证据里都必须是带正文的。
+    ///
+    /// # 自适应 cutoff（返回前的最后一道关卡）
+    ///
+    /// 预算阶梯只回答「最多能返回几条」，cutoff 回答「这几条里到底哪几条真的值得返回」。
+    /// 四条产出路径的 `final_score` 分属**四个分数域**，绝对值互相不可比：
+    ///
+    /// | 产出路径 | 分数域 | 典型量级 |
+    /// |---|---|---|
+    /// | 主路径 RRF 融合 | [`ScoreDomain::Rrf`] `Σ 1/(rrf_k+rank+1)` | 单通道 ≈0.0164 / 双通道 ≈0.0328 |
+    /// | Reranker 池内命中 | [`ScoreDomain::Rerank`] sigmoid 概率 | ≈[0, 1] |
+    /// | dense-only 降级 | [`ScoreDomain::DenseSim`] `1/(1+distance)` | ≈[0, 1] |
+    /// | sparse-only 降级 | [`ScoreDomain::Bm25Raw`] BM25 原始分 | 无上界 |
+    ///
+    /// 因此**绝不能**把绝对阈值直接打在 `final_score` 上：0.2 的阈值会让 RRF 结果全灭、
+    /// 却对 BM25 毫无约束。所有阈值一律作用在 [`ScoreDomain::to_relevance`] 归一化后的
+    /// `rel ∈ [0,1]` 上，`final_score` 字段本身保持原值（调用方会打印、JSON 也会透传）。
+    ///
+    /// 三闸门按 `绝对下限 → 相对比例 → 断层检测 → 保底` 级联，且**只做前缀截断**
+    /// （绝不中间挖洞）：
+    /// - 闸门一是**硬闸**：`rel <= abs_floor` 即截断，`min_keep` 也不能突破它；
+    /// - 闸门二、三是**软闸**：分别按「与 top1 的相对落差」「相邻项的相对跌幅」裁剪。
+    ///
+    /// [`ScoreDomain::Rrf`] 域**跳过**闸门三：RRF 分数是离散档位（双通道 1.0、单通道
+    /// 0.5 归一化后），相邻档位相对跌幅恒为 0.5，断层检测会退化成「砍掉所有单通道
+    /// 命中」的错误语义。RRF 域另有独立的 `rel_ratio_rrf` 兜底（默认 0.40 < 0.5），
+    /// 保证单通道命中不会被相对比例闸门一刀切掉，结果是**永不因绝对阈值清空**。
+    ///
+    /// cutoff 与 [`fill_from_complete_set`] 的先后关系固定为「先补满、再裁剪」：
+    /// 精排不足时先补齐到 `K_final`，随后 cutoff 才做裁决，补进来的未打分候选
+    /// `rel = 0` 会被绝对下限自然丢弃。**cutoff 之后绝不再补齐** —— 否则又会长回
+    /// 被裁掉的低分尾部，cutoff 语义被破坏。
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<FusedCandidate>> {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -409,12 +805,19 @@ impl HybridSearchService {
             (self.dense.search(query, dense_limit).await, None)
         };
 
-        // 两通道结果对称处理：任一条通道存活即出结果，只有两条都不可用时才整体失败
-        let mut fused: Vec<FusedCandidate> = match (dense_res, sparse_res_opt) {
+        // 两通道结果对称处理：任一条通道存活即出结果，只有两条都不可用时才整体失败。
+        // 同时记录「实际参与融合且有非空结果」的通道数 `rrf_channels` —— 它是 RRF 域
+        // 归一化分母的唯一依据（`max_possible = channels / (rrf_k + 1)`），因此必须在
+        // dense / sparse 被 move 进融合函数之前用 `is_empty()` 取出。
+        let (mut fused, rrf_channels): (Vec<FusedCandidate>, usize) =
+            match (dense_res, sparse_res_opt) {
             (Ok(dense), Some(Ok(sparse))) => {
                 debug!("Sparse channel returned {} results", sparse.len());
+                let channels = usize::from(!dense.is_empty()) + usize::from(!sparse.is_empty());
                 // Perform RRF fusion — 保留条数取 K_recall，保证不短于精排池与最终预算
-                self.reciprocal_rank_fusion(dense, sparse, budget.k_recall)
+                let fused = self.reciprocal_rank_fusion(dense, sparse, budget.k_recall);
+                // 两通道皆空时仍按 1 计，避免归一化分母为 0
+                (fused, channels.max(1))
             }
             (Ok(dense), Some(Err(e))) => {
                 warn!(
@@ -423,11 +826,24 @@ impl HybridSearchService {
                 );
                 // 降级：不施加 RRF / 短代码惩罚，也不进 reranker。
                 // dense 候选的正文自带，无需 hydrate_code_blocks，降级语义保持不变。
-                return Ok(Self::dense_only_candidates(dense, budget.k_final));
+                // 分数域是向量相似度（`1/(1+distance)`，约 [0,1]）⇒ 按 DenseSim 归一化
+                // 后做自适应 cutoff，取代单纯的 truncate。
+                let mut candidates = Self::dense_only_candidates(dense, budget.k_final);
+                adaptive_cutoff(
+                    &mut candidates,
+                    ScoreDomain::DenseSim,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
+                return Ok(candidates);
             }
             (Ok(dense), None) => {
-                // sparse 被禁用：空 sparse 走 fusion，等价于融合后的 dense-only 排序
-                self.reciprocal_rank_fusion(dense, Vec::new(), budget.k_recall)
+                // sparse 被禁用：空 sparse 走 fusion，等价于融合后的 dense-only 排序。
+                // 只有 dense 一条通道参与融合，故 channels 恒为 1。
+                (
+                    self.reciprocal_rank_fusion(dense, Vec::new(), budget.k_recall),
+                    1,
+                )
             }
             (Err(dense_e), Some(Ok(sparse))) => {
                 warn!(
@@ -440,14 +856,29 @@ impl HybridSearchService {
                 // 完整池同时是精排不足时唯一的补齐来源，因此这里不预先裁剪。
                 let pool_len = sparse.len();
                 let mut candidates = Self::sparse_only_candidates(sparse, pool_len);
+                // BM25 原始分无上界，必须以本批最高分（首条，列表按 BM25 排序）作归一化
+                // 分母；列表为空时 top = 0.0（归一化后全为 0，会被绝对下限清空）。
+                let bm25_domain = ScoreDomain::Bm25Raw {
+                    top: candidates.first().map(|c| c.final_score).unwrap_or(0.0),
+                };
                 Self::hydrate_code_blocks(&mut candidates).await;
 
                 if let Some(ref reranker) = self.reranker {
                     if reranker.config().enabled {
-                        return self.apply_rerank(reranker, query, candidates, budget).await;
+                        // 精排成功走 Rerank 域、失败回退走 bm25_domain，均由 apply_rerank
+                        // 内部统一施加 cutoff（并保证 cutoff 之后不再补齐）
+                        return self
+                            .apply_rerank(reranker, query, candidates, budget, bm25_domain)
+                            .await;
                     }
                 }
-                candidates.truncate(budget.k_final);
+                // 无 reranker：cutoff 取代原来单纯的 truncate(k_final)
+                adaptive_cutoff(
+                    &mut candidates,
+                    bm25_domain,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
                 return Ok(candidates);
             }
             (Err(dense_e), Some(Err(sparse_e))) => {
@@ -477,15 +908,29 @@ impl HybridSearchService {
         Self::hydrate_code_blocks(&mut fused).await;
 
         // Phase 2: Optional Cross-Encoder Rerank
+        // 主路径的分数域恒为 RRF：`max_possible = channels / (rrf_k + 1)`。双通道时
+        // top1 归一化为 1.0，单通道（sparse 被禁用）时归一化为 0.5 —— 注意此时绝对
+        // 下限 0.2 仍会让 0.5 通过，故单通道 RRF 结果不会被绝对阈值清空。
+        let rrf_domain = ScoreDomain::Rrf {
+            max_possible: rrf_channels as f64 / (self.config.rrf_k + 1.0),
+        };
+
         if let Some(ref reranker) = self.reranker {
             if reranker.config().enabled {
-                return self.apply_rerank(reranker, query, fused, budget).await;
+                return self
+                    .apply_rerank(reranker, query, fused, budget, rrf_domain)
+                    .await;
             }
         }
 
-        // 无 rerank 时截断到最终预算
+        // 无 rerank 时按 RRF 域做自适应 cutoff（有效长度先被 k_final 收窄）
         let mut result = fused;
-        result.truncate(budget.k_final);
+        adaptive_cutoff(
+            &mut result,
+            rrf_domain,
+            &self.config.cutoff,
+            budget.k_final,
+        );
         Ok(result)
     }
 
@@ -779,12 +1224,23 @@ impl HybridSearchService {
     /// 补齐来源是**完整原始候选集 `fused`**（而不是仅精排池外的尾部）：精排池只是召回集的
     /// 前缀，池外尾部同样是合法候选，某个池内候选因缺正文而无法打分时，真正该补上来的
     /// 可能是池外的靠前条目。补齐按 `snippet_id` 去重，见 [`fill_from_complete_set`]。
+    ///
+    /// # cutoff 语义（与补齐的先后关系）
+    /// 成功分支固定为「先补满、再裁剪」：`truncate(K_final)` → [`fill_from_complete_set`]
+    /// → [`adaptive_cutoff`]（[`ScoreDomain::Rerank`]）。补进来的池外候选没有 cross-encoder
+    /// 分数（`rel = 0`），会被绝对下限自然丢弃 —— 这是「宁缺毋滥」的期望行为，
+    /// 因此这里**不显式过滤**未打分候选，交给统一的 cutoff 裁决。cutoff 还会按 `rel`
+    /// 重排，顺带修复「补齐项 `final_score` 可能大于池内低分」导致的非单调问题。
+    /// 失败分支则用调用方传入的 `rrf_domain`（主路径 [`ScoreDomain::Rrf`]、
+    /// sparse-only 降级 [`ScoreDomain::Bm25Raw`]）施加同一套 cutoff。
+    /// **cutoff 之后不得再补齐**，否则会重新长回被裁掉的低分尾部。
     async fn apply_rerank(
         &self,
         reranker: &RerankerService,
         query: &str,
         fused: Vec<FusedCandidate>,
         budget: SearchBudget,
+        rrf_domain: ScoreDomain,
     ) -> Result<Vec<FusedCandidate>> {
         // 池大小 >= min(k_final, fused.len())，且不超过候选总数
         let pool_size = budget.k_rerank.min(fused.len());
@@ -817,14 +1273,31 @@ impl HybridSearchService {
                     );
                 }
 
+                // 先补满再裁剪：补进来的未打分候选 rel=0，会被绝对下限丢弃 —— 这正是
+                // 「宁缺毋滥」的期望行为，因此不显式过滤它们，交给统一的 cutoff 处理。
+                // cutoff 同时按 rel 重排，修复「补齐项 final_score 可能大于池内低分」造成
+                // 的非单调问题。cutoff 之后**不得**再补齐（否则破坏 cutoff 语义）。
+                adaptive_cutoff(
+                    &mut reranked,
+                    ScoreDomain::Rerank,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
+
                 debug!("Reranker: final {} results after rerank", reranked.len());
                 Ok(reranked)
             }
             Err(e) => {
-                // 降级：返回 RRF 结果
+                // 降级：返回 RRF 结果（分数域由调用方给出：主路径是 Rrf，sparse-only
+                // 降级是 Bm25Raw），同样施加自适应 cutoff
                 warn!("Reranker failed, falling back to RRF results: {}", e);
                 let mut fallback = fused;
-                fallback.truncate(budget.k_final);
+                adaptive_cutoff(
+                    &mut fallback,
+                    rrf_domain,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
                 Ok(fallback)
             }
         }
@@ -1420,5 +1893,293 @@ mod tests {
             !ids(&ranked).contains(&"c4"),
             "补到 k_final 即停，不应越过预算"
         );
+    }
+
+    // ---- 自适应 cutoff ---------------------------------------------------
+
+    /// 构造指定 `final_score` 的候选，id 自增以便断言「第几条还在」。
+    fn candidate_scored(id: &str, score: f64) -> FusedCandidate {
+        let mut c = candidate_with_id(id);
+        c.final_score = score;
+        c
+    }
+
+    fn candidates_with_scores(scores: &[f64]) -> Vec<FusedCandidate> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| candidate_scored(&format!("c{}", i), *s))
+            .collect()
+    }
+
+    fn scores_of(candidates: &[FusedCandidate]) -> Vec<f64> {
+        candidates.iter().map(|c| c.final_score).collect()
+    }
+
+    #[test]
+    fn cutoff_user_example_drops_low_score() {
+        // 用户给的示例分布：[0.85, 0.81, 0.7, 0.2] → 丢掉 0.2，保留 3 条
+        let mut candidates = candidates_with_scores(&[0.85, 0.81, 0.7, 0.2]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(report.before, 4);
+        assert_eq!(candidates.len(), 3, "0.2 那条必须被绝对下限丢弃");
+        assert_eq!(report.after, 3);
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+        assert!(!scores_of(&candidates).contains(&0.2));
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.85, 0.81, 0.7],
+            "保留区间按 rel 降序，且只做前缀截断"
+        );
+    }
+
+    #[test]
+    fn cutoff_smooth_distribution_not_cut() {
+        // 平滑分布：相邻跌幅只有 ~0.012，断层检测必须不触发
+        let mut candidates = candidates_with_scores(&[0.85, 0.84, 0.83, 0.82]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 4, "平滑分布不得被裁剪");
+        assert_eq!(report.trigger, CutoffTrigger::None);
+        assert_eq!(report.len_gap, 4, "len_gap 应等于 len_ratio（未发现断层）");
+    }
+
+    #[test]
+    fn cutoff_dominant_top_cuts_tail() {
+        // top1 远高于其后 ⇒ 相对比例闸门（0.9 × 0.55 = 0.495）只放行 1 条
+        let mut candidates = candidates_with_scores(&[0.9, 0.3, 0.29, 0.28]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 1, "只应保留头部 1 条");
+        assert_eq!(candidates[0].final_score, 0.9);
+        assert_eq!(report.len_ratio, 1);
+        assert_eq!(report.trigger, CutoffTrigger::RelativeRatio);
+    }
+
+    #[test]
+    fn cutoff_absolute_floor_is_hard() {
+        // 全部低于绝对下限 ⇒ 硬闸直接清空（不受 min_keep 影响）
+        let mut candidates = candidates_with_scores(&[0.15, 0.12]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert!(candidates.is_empty(), "全部 rel <= abs_floor 时必须清空");
+        assert_eq!(report.after, 0);
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+    }
+
+    #[test]
+    fn cutoff_absolute_floor_is_exclusive() {
+        // 严格大于才通过：rel == abs_floor(0.2) 必须被丢弃
+        let mut candidates = candidates_with_scores(&[0.5, 0.2]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].final_score, 0.5);
+        assert!(
+            !scores_of(&candidates).contains(&0.2),
+            "rel == abs_floor 必须被丢弃（判定用严格大于）"
+        );
+    }
+
+    #[test]
+    fn cutoff_rrf_domain_never_empties_results() {
+        // 双通道 RRF：top1 = 2/(k+1)，其余单通道 = 1/(k+1)
+        let rrf_k = 60.0;
+        let max_possible = 2.0 / (rrf_k + 1.0);
+        let mut candidates = candidates_with_scores(&[
+            2.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+        ]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(
+            &mut candidates,
+            ScoreDomain::Rrf { max_possible },
+            &cfg,
+            10,
+        );
+
+        assert!(!candidates.is_empty(), "RRF 域绝不能被绝对下限清空");
+        assert_eq!(report.len_ratio, 3, "rel_ratio_rrf=0.40 生效，单通道 rel=0.5 全部通过");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "若误用连续域的 rel_ratio=0.55，单通道 rel=0.5 会被砍到只剩 1 条"
+        );
+        assert_eq!(report.trigger, CutoffTrigger::None);
+    }
+
+    #[test]
+    fn cutoff_rrf_domain_skips_gap_detection() {
+        // 双通道 top1(rel=1.0) + 3 条单通道(rel=0.5)：相对跌幅恒为 0.5
+        let rrf_k = 60.0;
+        let max_possible = 2.0 / (rrf_k + 1.0);
+        let mut candidates = candidates_with_scores(&[
+            2.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+        ]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(
+            &mut candidates,
+            ScoreDomain::Rrf { max_possible },
+            &cfg,
+            10,
+        );
+
+        assert_eq!(
+            report.len_gap, report.len_ratio,
+            "RRF 域必须跳过断层检测：len_gap 恒等于 len_ratio"
+        );
+        assert!(
+            candidates.len() > 1,
+            "档位跌幅 0.5 不得把结果砍到 1 条，实际 {}",
+            candidates.len()
+        );
+        assert_eq!(candidates.len(), 4);
+
+        // 对照：同一套阈值在连续域会真的触发断层（[0.9,0.6,0.55,0.3] 首对跌幅 0.333）
+        let mut continuous = candidates_with_scores(&[0.9, 0.6, 0.55, 0.3]);
+        let report_c = adaptive_cutoff(&mut continuous, ScoreDomain::Rerank, &cfg, 10);
+        assert_eq!(report_c.trigger, CutoffTrigger::ScoreGap);
+        assert_eq!(continuous.len(), 1, "连续域断层检测应真正生效");
+    }
+
+    #[test]
+    fn cutoff_disabled_is_pure_truncate() {
+        let mut candidates = candidates_with_scores(&[0.9, 0.88, 0.86, 0.84, 0.82]);
+        let cfg = AdaptiveCutoffConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 3);
+
+        assert_eq!(candidates.len(), 3, "关闭时仅按 k_final 截断");
+        assert_eq!(report.trigger, CutoffTrigger::Disabled);
+        assert_eq!(report.after, 3);
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.9, 0.88, 0.86],
+            "关闭时不重排、不裁剪，退化为旧行为"
+        );
+    }
+
+    #[test]
+    fn cutoff_handles_nan_scores() {
+        // NaN 分数不得 panic；rel=0 ⇒ 排到末尾并被绝对下限丢弃
+        let mut candidates = candidates_with_scores(&[0.9, f64::NAN, 0.85]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 2, "NaN 项应被丢弃");
+        assert!(candidates.iter().all(|c| c.final_score.is_finite()));
+        assert_eq!(scores_of(&candidates), vec![0.9, 0.85]);
+        assert_eq!(report.before, 3);
+        assert_eq!(report.after, 2);
+    }
+
+    #[test]
+    fn cutoff_single_candidate_and_empty() {
+        let cfg = AdaptiveCutoffConfig::default();
+
+        // 空输入
+        let mut empty: Vec<FusedCandidate> = Vec::new();
+        let report = adaptive_cutoff(&mut empty, ScoreDomain::Rerank, &cfg, 10);
+        assert!(empty.is_empty());
+        assert_eq!(report, CutoffReport::default(), "空输入返回全 0 报告");
+
+        // 单条且高于下限
+        let mut single = candidates_with_scores(&[0.9]);
+        let report = adaptive_cutoff(&mut single, ScoreDomain::Rerank, &cfg, 10);
+        assert_eq!(single.len(), 1);
+        assert_eq!(report.len_abs, 1);
+        assert_eq!(report.trigger, CutoffTrigger::None);
+
+        // 单条且低于下限
+        let mut weak = candidates_with_scores(&[0.1]);
+        let report = adaptive_cutoff(&mut weak, ScoreDomain::Rerank, &cfg, 10);
+        assert!(weak.is_empty());
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+    }
+
+    #[test]
+    fn cutoff_resorts_non_monotonic_input() {
+        // 复现 apply_rerank 成功分支的非单调：fill_from_complete_set 把未打分的 RRF
+        // 候选（0.0328）追加到 rerank 低分（0.2）之后，输入并非降序
+        let mut candidates = candidates_with_scores(&[0.0328, 0.88, 0.2, 0.85]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.88, 0.85],
+            "必须按 rel 重排后再截断：高分项不得被误杀，输出严格降序"
+        );
+        assert_eq!(report.before, 4);
+        assert_eq!(report.after, 2);
+    }
+
+    #[test]
+    fn cutoff_respects_k_final() {
+        let mut candidates = candidates_with_scores(&[0.9; 10]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 3);
+
+        assert_eq!(candidates.len(), 3, "不得突破 k_final");
+        assert_eq!(report.len_abs, 3, "有效长度被 k_final 收窄");
+        assert_eq!(report.trigger, CutoffTrigger::None);
+    }
+
+    #[test]
+    fn to_relevance_maps_each_domain() {
+        // RRF：双通道 top1 → 1.0，单通道 top1 → 0.5
+        let rrf_k = 60.0;
+        let dual = ScoreDomain::Rrf {
+            max_possible: 2.0 / (rrf_k + 1.0),
+        };
+        assert_eq!(dual.to_relevance(2.0 / (rrf_k + 1.0)), 1.0);
+        assert!(
+            (dual.to_relevance(1.0 / (rrf_k + 1.0)) - 0.5).abs() < 1e-12,
+            "单通道 top1 归一化为 0.5"
+        );
+        assert_eq!(dual.to_relevance(1.0), 1.0, "超出上界的分数被 clamp");
+
+        // dense 相似度：本身就在 [0,1]，越界 clamp
+        assert!((ScoreDomain::DenseSim.to_relevance(0.7) - 0.7).abs() < 1e-12);
+        assert_eq!(ScoreDomain::DenseSim.to_relevance(1.7), 1.0);
+        assert_eq!(ScoreDomain::DenseSim.to_relevance(-0.5), 0.0);
+
+        // BM25 原始分：以本批 top 为分母
+        let bm25 = ScoreDomain::Bm25Raw { top: 10.0 };
+        assert!((bm25.to_relevance(5.0) - 0.5).abs() < 1e-12);
+        assert_eq!(bm25.to_relevance(20.0), 1.0, "超过 top 时 clamp 到 1.0");
+        assert_eq!(
+            ScoreDomain::Bm25Raw { top: 0.0 }.to_relevance(5.0),
+            0.0,
+            "分母为 0 时一律 0.0，不产生 inf/NaN"
+        );
+
+        // reranker 概率：直接 clamp；非有限输入 → 0.0
+        assert!((ScoreDomain::Rerank.to_relevance(0.42) - 0.42).abs() < 1e-12);
+        assert_eq!(ScoreDomain::Rerank.to_relevance(f64::NAN), 0.0);
+        assert_eq!(ScoreDomain::Rerank.to_relevance(f64::INFINITY), 0.0);
     }
 }
