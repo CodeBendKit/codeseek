@@ -312,6 +312,15 @@ impl RustParser {
                         let field = function_node.child_by_field_name("field").unwrap();
                         decl.ast_fields.name = code.slice(field.byte_range()).to_string();
                         let value_node = function_node.child_by_field_name("value").unwrap();
+                        // Phase P1 交付物 2(a)：receiver 不再只降级成 VariableUsage。
+                        // 下面 `dirty hack` 的 caller_guid 逻辑与 usages 的产出**一字未改**
+                        // （符号数量、类型分布、caller_guid 归属全部保持 P0 基线事实），
+                        // 只是额外把 receiver 的源码文本记到调用符号自己身上，
+                        // 让 P2 的 resolver 能拿到 `calc.add(x)` 里的 `calc`。
+                        // trim 是为了去掉链式/多行 receiver 携带的首尾换行与缩进空白。
+                        decl.receiver = Some(
+                            code.slice(value_node.byte_range()).trim().to_string(),
+                        );
                         let usages = self.parse_usages(&value_node, code, path, parent_guid, is_error);
                         if !usages.is_empty() {
                             if let Some(last) = usages.last() {

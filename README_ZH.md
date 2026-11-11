@@ -213,7 +213,8 @@ codeseek uninstall
     "model": "Qwen/Qwen3-Embedding-4B",
     "api_token": "sk-...",
     "api_base_url": "https://api.siliconflow.cn/v1",
-    "dimensions": 2560
+    "dimensions": 2560,
+    "instruct": "Given a code search query, retrieve relevant functions or code snippets that answer the query."
   },
   "index": {
     "min_code_block_length": 16,
@@ -238,6 +239,11 @@ codeseek uninstall
   "installed_hooks": {}
 }
 ```
+
+> `embedding.instruct` —— Qwen3-Embedding 的查询侧指令（非对称检索）。只有**查询**会被加上官方
+> 前缀 `Instruct: {instruct}\nQuery:{查询原文}`（`Instruct:` 后有一个空格，`Query:` 后无空格）；
+> 入库的代码保持裸文本，已有向量索引不受影响。省略该字段即使用上面这条默认指令；
+> 配置为 `""` 则完全关闭前缀注入。
 
 ### 模型角色
 

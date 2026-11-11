@@ -110,6 +110,13 @@ pub struct PetCodeGraph {
 
 **边**：`CallRelation`，包含 `caller_id`、`callee_id`、`is_resolved`（是否成功解析）、行号
 
+- `resolution_level`：命中该边所依据的解析层级（`0`=未解析 .. `8`=启发式兜底；`--resolver=legacy` 产出的边这四个解析标量恒为 `0`）
+- `confidence`：该层级的置信度（由 `resolution_level` 推导，`0..=98`，随层级单调递减；冗余存一份，落盘后不必重算）
+- `rank`：同一调用点候选里的排序位（`0`=最优；同层多候选**只排序、不淘汰**）
+- `candidate_count`：该调用点**截断前**的真实候选个数（`≥2` 即判 `Ambiguous`，`--max-candidates` 只截断落盘条数、不改这个数；口径见 [../rust-core/docs/call-graph-resolution.md](../rust-core/docs/call-graph-resolution.md)）
+
+> 调用边的**分层精度解析**以 [rust-core/docs/call-graph-resolution.md](../rust-core/docs/call-graph-resolution.md) 为权威文档：九级分层口径、边上的解析元信息（level/confidence/rank/candidate_count）、幽灵节点规则、图缓存契约与 legacy 回滚。改解析行为前先读它。
+
 **核心查询方法**：
 
 | 方法 | 说明 |

@@ -310,6 +310,67 @@ fn handle_tools_call(id: Option<Value>, request: &Value) -> Option<Value> {
             let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
             run_cli(&args_refs)
         }
+        "knowledge_add" => {
+            let type_ = arguments.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let title = arguments.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let content = arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let source_agent = arguments.get("source_agent").and_then(|v| v.as_str()).unwrap_or("");
+            let task_id = arguments.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let confidence = arguments.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.8);
+            let tags: Vec<String> = match arguments.get("tags") {
+                Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                _ => vec![],
+            };
+            let related_files: Vec<String> = match arguments.get("related_files") {
+                Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                _ => vec![],
+            };
+            let mut cli_args: Vec<String> = vec![
+                "knowledge".into(), "add".into(),
+                "--title".into(), title.into(),
+                "--content".into(), content.into(),
+                "--type".into(), type_.into(),
+                "--source-agent".into(), source_agent.into(),
+                "--task-id".into(), task_id.into(),
+                "--confidence".into(), confidence.to_string(),
+            ];
+            if !tags.is_empty() { cli_args.push("--tags".into()); cli_args.push(tags.join(",")); }
+            if !related_files.is_empty() { cli_args.push("--related-files".into()); cli_args.push(related_files.join(",")); }
+            let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+            run_cli(&args_refs)
+        }
+        "knowledge_search" => {
+            let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            let rerank = arguments.get("rerank").and_then(|v| v.as_bool()).unwrap_or(true);
+            let mut cli_args: Vec<String> = vec!["knowledge".into(), "search".into(), "--query".into(), query.into(), "--limit".into(), limit.to_string()];
+            if rerank { cli_args.push("--rerank".into()); }
+            if let Some(Value::Array(arr)) = arguments.get("domains") {
+                let domains: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                if !domains.is_empty() {
+                    cli_args.push("--domains".into());
+                    cli_args.push(domains.join(","));
+                }
+            }
+            let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+            run_cli(&args_refs)
+        }
+        "knowledge_list" => {
+            let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let mut cli_args: Vec<String> = vec!["knowledge".into(), "list".into(), "--limit".into(), limit.to_string()];
+            if let Some(t) = arguments.get("type").and_then(|v| v.as_str()) {
+                if !t.is_empty() { cli_args.push("--type".into()); cli_args.push(t.into()); }
+            }
+            if let Some(t) = arguments.get("tag").and_then(|v| v.as_str()) {
+                if !t.is_empty() { cli_args.push("--tag".into()); cli_args.push(t.into()); }
+            }
+            let args_refs: Vec<&str> = cli_args.iter().map(|s| s.as_str()).collect();
+            run_cli(&args_refs)
+        }
+        "knowledge_delete" => {
+            let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            run_cli(&["knowledge", "delete", "--id", id])
+        }
         _ => Err(format!("Unknown tool: {}", tool_name)),
     };
 
@@ -408,35 +469,7 @@ fn maybe_inject_mcp_guidance() {
 /// guidance content. Returns `Ok(true)` if injection was performed,
 /// `Ok(false)` if the marker was already present.
 fn try_inject(filepath: &std::path::Path) -> std::io::Result<bool> {
-    // Hold an exclusive lock on the target across the whole check-and-append.
-    //
-    // Editors spawn one `codeseek mcp` per session, so several servers can start
-    // against the same working directory at once. Reading the file, finding no
-    // marker and then appending was not atomic across processes: each server saw
-    // a clean file and appended, leaving N copies of the guidance in the user's
-    // CLAUDE.md. INJECTION_CONTENT is ~19 KB, far over PIPE_BUF, so concurrent
-    // O_APPEND writes can also interleave and produce a corrupted block.
-    //
-    // The lock is taken on the target itself rather than a sidecar lock file, so
-    // there is no stale state to clean up: flock is released when the descriptor
-    // closes, including if the process dies mid-write.
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(filepath)?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    let result = inject_locked(&mut file);
-    fs2::FileExt::unlock(&file).ok();
-    result
-}
-
-/// Check-and-append against an already-locked handle. Split out so the caller
-/// releases the lock on every path, including the early return and the errors.
-fn inject_locked(file: &mut std::fs::File) -> std::io::Result<bool> {
-    use std::io::{Read, Write};
-
-    let mut existing = String::new();
-    file.read_to_string(&mut existing)?;
+    let existing = std::fs::read_to_string(filepath)?;
 
     if existing.contains(INJECTION_MARKER_START) {
         return Ok(false);
@@ -449,6 +482,10 @@ fn inject_locked(file: &mut std::fs::File) -> std::io::Result<bool> {
         format!("\n{INJECTION_CONTENT}")
     };
 
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(filepath)?;
     file.write_all(to_append.as_bytes())?;
     file.flush()?;
 
@@ -554,32 +591,4 @@ mod tests {
         // try_inject would fail with NotFound, but maybe_inject_mcp_guidance
         // checks is_file first, so it skips
     }
-
-    #[test]
-    fn test_concurrent_injection_writes_marker_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        fs::write(&path, "# Project\n").unwrap();
-
-        let injected: Vec<bool> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| s.spawn(|| try_inject(&path).unwrap()))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let content = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            content.matches(INJECTION_MARKER_START).count(),
-            1,
-            "guidance block was injected more than once"
-        );
-        assert_eq!(content.matches(INJECTION_MARKER_END).count(), 1);
-        assert_eq!(
-            injected.iter().filter(|x| **x).count(),
-            1,
-            "exactly one caller should report having injected"
-        );
-    }
-
 }

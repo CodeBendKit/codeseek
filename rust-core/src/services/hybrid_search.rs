@@ -5,11 +5,75 @@
 
 use crate::services::embedding_service::{EmbeddingService, SearchResult};
 use crate::services::reranker_service::RerankerService;
-use crate::storage::traits_bm25::{CandidateSource, FusedCandidate, TextSearchProvider, TextSearchResult};
-use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use crate::storage::traits_bm25::{
+    parse_snippet_id, CandidateSource, CodeChunk, FusedCandidate, TextSearchProvider,
+    TextSearchResult,
+};
+use anyhow::{anyhow, Result};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
+
+/// 自适应 cutoff 配置 —— 在**分数域归一化**之后执行的「三闸门级联截断」参数。
+///
+/// 为什么必须先归一化：`FusedCandidate::final_score` 在四条产出路径上分属四个完全
+/// 不同的分数域（RRF 融合分、向量相似度、BM25 原始分、cross-encoder 概率），绝对值
+/// 互相不可比。因此本配置的所有阈值都作用在 [`ScoreDomain::to_relevance`] 归一化后的
+/// `rel ∈ [0, 1]` 上；`final_score` 字段本身**永不被改写**（调用方会打印它，JSON 也
+/// 会原样透传）。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct AdaptiveCutoffConfig {
+    /// 总开关。`false` 时退化为「仅按 `k_final` 截断」的旧行为（`trigger = Disabled`）。
+    ///
+    /// 排查「结果莫名变少」时先关它：这是唯一一键回到旧行为的旋钮。
+    pub enabled: bool,
+    /// 闸门一：绝对下限（硬闸）。归一化分数 `rel <= abs_floor` 的候选**及其后所有
+    /// 候选**一律丢弃 —— 语义是「这些条目与查询的相关度低于可用门槛」。
+    ///
+    /// 取值域 `[0, 1]`，用**严格大于**判定通过（`rel == 0.2` 配 `abs_floor = 0.2` 会被
+    /// 丢弃）。调大：更激进，可能直接返回 0 条；调小：更保守，几乎不靠它裁剪。
+    /// 它是三闸门中唯一的硬闸：`min_keep` 也不能突破它。
+    pub abs_floor: f64,
+    /// 闸门二：相对比例（连续域与 dense 降级域使用）。只保留
+    /// `rel >= rel_ratio × rel[0]` 的前缀，即「允许的最大相对落差」。
+    ///
+    /// 取值域 `[0, 1]`（实现侧再 `clamp` 一次）；1.0 等价于「只留与 top1 同分者」。
+    /// 调大：容忍更多尾部；调小：只保留贴近头部的条目。
+    pub rel_ratio: f64,
+    /// 闸门二在 **RRF 域**使用的相对比例。
+    ///
+    /// RRF 分数是离散档位（双通道 `2/(rrf_k+1)`、单通道 `1/(rrf_k+1)`），双通道与
+    /// 单通道之相对落差恒为 0.5，因此本默认值（0.40）必须**低于 0.5**，否则所有单通道
+    /// 命中都会被一刀砍掉。取值域 `[0, 1]`；调大超过 0.5 即开始丢单通道命中。
+    pub rel_ratio_rrf: f64,
+    /// 闸门三：断层检测阈值（**仅连续分数域**）。相邻两项的相对跌幅
+    /// `(rel[i] - rel[i+1]) / rel[i] >= gap_min` 视为「断层」，并截断在断层之前。
+    ///
+    /// 取值域 `[0, 1]`。调大：只有陡峭断崖才触发（结果更少被裁）；调小：轻微落差
+    /// 即视为断层（结果更容易被砍）。RRF 域**完全跳过**本闸门，原因见
+    /// [`adaptive_cutoff`] 内的注释。
+    pub gap_min: f64,
+    /// 保底条数：裁剪后至少保留这么多条，但受闸门一硬上限约束，即
+    /// `final_len = max(闸门结果, min_keep.min(len_abs))`。0 表示不保底。
+    ///
+    /// 调大：结果更「宽」，但可能带回被比例/断层闸门判定为不相关的条目；
+    /// 调小：更严格，允许只返回 1 条甚至 0 条。
+    pub min_keep: usize,
+}
+
+impl Default for AdaptiveCutoffConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            abs_floor: 0.2,
+            rel_ratio: 0.55,
+            rel_ratio_rrf: 0.40,
+            gap_min: 0.30,
+            min_keep: 1,
+        }
+    }
+}
 
 /// Configuration for hybrid search behavior.
 #[derive(Debug, Clone)]
@@ -17,11 +81,18 @@ pub struct HybridSearchConfig {
     /// RRF fusion constant. Higher = ranks matter less.
     /// Industry standard is 60. See: https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf
     pub rrf_k: f64,
-    /// Number of dense (vector) results to fetch per fusion query.
-    /// Should be >= top_k to ensure enough candidates for fusion.
+    /// Dense (vector) 通道的取回条数 —— 作为 `K_recall` 的**下界**。
+    ///
+    /// 实际取回条数由 [`SearchBudget`] 统一推导：
+    /// `K_recall = max(dense_limit, sparse_limit, K_rerank)`。
+    /// 因此本字段**不再**单独决定 RRF 融合后的保留条数（旧实现直接把
+    /// `max(dense_limit, sparse_limit)` 当作融合截断长度，当调用方的 `limit`
+    /// 大于该值时，融合结果会比最终预算还短）。调大它可以提升召回规模。
     pub dense_limit: usize,
-    /// Number of sparse (BM25) results to fetch per fusion query.
-    /// Should be >= top_k to ensure enough candidates for fusion.
+    /// Sparse (BM25) 通道的取回条数 —— 作为 `K_recall` 的**下界**。
+    ///
+    /// 与 [`Self::dense_limit`] 共同决定 `K_recall`（取两者与 `K_rerank` 的最大值），
+    /// 同样不再单独决定融合截断长度。
     pub sparse_limit: usize,
     /// Whether to enable the sparse (BM25) channel.
     /// When false, falls back to dense-only search.
@@ -29,12 +100,17 @@ pub struct HybridSearchConfig {
     /// Timeout for the entire hybrid search operation (milliseconds).
     /// 0 means no timeout.
     pub timeout_ms: u64,
-    /// Threshold (in chars) for short code penalty. 
+    /// Threshold (in chars) for short code penalty.
     /// Code blocks shorter than this get their score reduced.
     pub short_code_threshold: usize,
     /// Penalty strength for short code blocks (0.0 = no penalty, 1.0 = full penalty).
     /// Applied as: penalty = 1.0 - max(0, 1 - len/threshold) * strength
     pub short_code_penalty: f64,
+    /// 自适应 cutoff（分数域归一化后的三闸门级联截断）参数。
+    ///
+    /// 与 RRF 融合公式、[`SearchBudget`] 预算阶梯彼此正交：它只在预算截断**之后**
+    /// 决定「这批结果里到底有几条真的值得返回」。详见 [`AdaptiveCutoffConfig`]。
+    pub cutoff: AdaptiveCutoffConfig,
 }
 
 impl Default for HybridSearchConfig {
@@ -47,6 +123,7 @@ impl Default for HybridSearchConfig {
             timeout_ms: 0,
             short_code_threshold: 30,
             short_code_penalty: 0.5,
+            cutoff: AdaptiveCutoffConfig::default(),
         }
     }
 }
@@ -66,35 +143,534 @@ impl Default for HybridSearchConfig {
 ///      └──→ (Optional) Cross-Encoder Reranker ──→ Final Results
 /// ```
 ///
-/// Internal metadata structure used to track line info during RRF fusion.
-#[derive(Clone)]
-struct DenseMeta {
-    file_path: String,
-    symbol_name: String,
-    code_block: String,
-    line_start: usize,
-    line_end: usize,
-}
-
-impl From<&SearchResult> for DenseMeta {
-    fn from(sr: &SearchResult) -> Self {
-        let line_count = sr.code_block.lines().count();
-        Self {
-            file_path: sr.file_path.clone(),
-            symbol_name: sr.symbol_name.clone(),
-            code_block: sr.code_block.clone(),
-            line_start: 0,
-            line_end: line_count,
-        }
-    }
-}
-
+/// 降级方向（两通道对称）：dense 失败 → sparse-only；sparse 禁用/失败 → dense-only；
+/// dense 失败且无可用 sparse → 返回 `Err`，由调用方回退到 PetCodeGraph 名称搜索。
+///
+/// 降级路径一律跳过 RRF；是否执行 Reranker 取决于正文是否可得：sparse-only 降级会先用
+/// [`HybridSearchService::hydrate_code_blocks`] 回填正文再精排，dense-only 降级正文自带，
+/// 但没有另一侧可比较的分数，因此仍不重排。详见 [`HybridSearchService::search`]。
 pub struct HybridSearchService {
     dense: Arc<EmbeddingService>,
     sparse: Arc<dyn TextSearchProvider>,
     config: HybridSearchConfig,
     /// 可选的 Cross-Encoder Reranker 服务（RRF 融合后执行精排）
     reranker: Option<RerankerService>,
+}
+
+/// Internal metadata structure used to track line info during RRF fusion.
+///
+/// Filled from either channel: the dense channel carries the real `code_block` /
+/// line range / language, the sparse (BM25) channel carries path, symbol, language
+/// and — because Tantivy does not store `line_start` as a field — a `line_start`
+/// reverse-parsed out of its `snippet_id` (see [`sparse_line_start`]).
+/// Missing pieces are merged from the other channel via [`FusionMeta::merge_missing`].
+#[derive(Clone, Default)]
+struct FusionMeta {
+    file_path: String,
+    symbol_name: String,
+    language: String,
+    code_block: String,
+    line_start: usize,
+    line_end: usize,
+}
+
+impl From<&SearchResult> for FusionMeta {
+    fn from(sr: &SearchResult) -> Self {
+        Self {
+            file_path: sr.file_path.clone(),
+            symbol_name: sr.symbol_name.clone(),
+            language: sr.language.clone(),
+            code_block: sr.code_block.clone(),
+            line_start: sr.line_start,
+            line_end: sr.line_end,
+        }
+    }
+}
+
+/// Line number of a sparse (BM25) hit.
+///
+/// The Tantivy schema has no `line_start` field, so the real line is only available
+/// inside `snippet_id` (`{file_path}#{line_start}#{symbol_name}`, built by
+/// [`CodeChunk::generate_id`]). Prefer the already-populated `line_start` when a
+/// provider supplies it, otherwise reverse-parse it from the id; 0 means unknown.
+fn sparse_line_start(sr: &TextSearchResult) -> usize {
+    if sr.line_start != 0 {
+        return sr.line_start;
+    }
+    parse_snippet_id(&sr.snippet_id)
+        .map(|(_, line_start, _)| line_start)
+        .unwrap_or(0)
+}
+
+/// BM25 通道回填正文时，从 `line_start` 起最多读取的行数。
+///
+/// BM25 索引不存 `line_end`（Tantivy schema 里没有该字段），无法得知符号真实结束行，
+/// 因此取一个足够宽的窗口而不是试图精确截断：多读几行上下文比截断到半句更利于
+/// cross-encoder 打分，也比留下空文档强。
+const BM25_BACKFILL_MAX_LINES: usize = 60;
+
+/// 从整份文件内容中按 1-based 闭区间 `[line_start, line_end]` 切出代码片段。
+///
+/// `line_end == 0`（BM25 通道不存结束行）时退化为 `line_start .. line_start + fallback_lines`
+/// 的窗口。返回 `(片段, 实际结束行)`；行号不可用（`line_start == 0`）、越界、或片段全是
+/// 空白时返回 `None` —— 调用方据此保持候选原样，绝不把半截或空白噪声写进证据。
+///
+/// 结果保留原始缩进（不做 trim），因为缩进本身也是代码正文的一部分。
+fn slice_code_lines(
+    content: &str,
+    line_start: usize,
+    line_end: usize,
+    fallback_lines: usize,
+) -> Option<(String, usize)> {
+    if line_start == 0 {
+        return None;
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if line_start > total {
+        return None;
+    }
+
+    let end = if line_end >= line_start {
+        // dense 通道给了真实结束行：沿用它，越界则 clamp 到文件末尾
+        line_end.min(total)
+    } else {
+        // BM25 通道没有结束行：向后取固定窗口
+        let window = fallback_lines.max(1);
+        line_start.saturating_add(window - 1).min(total)
+    };
+
+    let snippet = lines[line_start - 1..end].join("\n");
+    if snippet.trim().is_empty() {
+        return None;
+    }
+    Some((snippet, end))
+}
+
+impl From<&TextSearchResult> for FusionMeta {
+    fn from(sr: &TextSearchResult) -> Self {
+        Self {
+            file_path: sr.file_path.clone(),
+            symbol_name: sr.symbol_name.clone(),
+            language: sr.language.clone(),
+            // BM25 通道不存储正文（content 非 STORED），保持为空串；
+            // 正文由 [`HybridSearchService::hydrate_code_blocks`] 在调用侧从源文件回填
+            code_block: String::new(),
+            // 行号从 snippet_id 反解得到（Tantivy 未存 line_start 字段）
+            line_start: sparse_line_start(sr),
+            // BM25 通道不存储结束行
+            line_end: 0,
+        }
+    }
+}
+
+impl FusionMeta {
+    /// Fill only the fields this side is missing from `other`.
+    ///
+    /// "Missing" means empty string for text fields and `0` for line numbers,
+    /// so real data already present is never overwritten by a placeholder.
+    fn merge_missing(&mut self, other: &Self) {
+        if self.file_path.is_empty() {
+            self.file_path = other.file_path.clone();
+        }
+        if self.symbol_name.is_empty() {
+            self.symbol_name = other.symbol_name.clone();
+        }
+        if self.language.is_empty() {
+            self.language = other.language.clone();
+        }
+        if self.code_block.is_empty() {
+            self.code_block = other.code_block.clone();
+        }
+        if self.line_start == 0 {
+            self.line_start = other.line_start;
+        }
+        if self.line_end == 0 {
+            self.line_end = other.line_end;
+        }
+    }
+}
+
+/// Build the snippet id of a dense result using the very same scheme as the
+/// Tantivy index (`CodeChunk::generate_id`), so both ranked lists can be merged
+/// by id. Format: `{file_path}#{line_start}#{symbol_name}`.
+///
+/// 只用于 sparse 通道不可用的降级路径：那里没有 BM25 结果可借行号，
+/// 只能按 dense 自带的行号成 id。[`HybridSearchService::fuse`] 会在回填
+/// 行号后重算 id，因此不复用此函数。
+fn dense_snippet_id(sr: &SearchResult) -> String {
+    CodeChunk::generate_id(&sr.file_path, sr.line_start, &sr.symbol_name)
+}
+
+/// 检索预算阶梯：保证 `k_recall >= k_rerank >= k_final`。
+///
+/// 旧实现里三档预算各自演算（融合用 `max(dense_limit, sparse_limit)`、精排池用
+/// `limit * candidate_multiplier`、reranker 内部 `top_n` 用配置常量），彼此没有约束，
+/// 于是出现「融合截断短于最终预算」「精排池小于最终预算」「最终名次混用 RRF 分数」
+/// 这些不一致。这里把三档一次性推导出来，其余位置只读这个结构。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchBudget {
+    /// 最终返回条数（调用方请求的 limit）
+    k_final: usize,
+    /// 送入 cross-encoder 的候选条数（reranker 未启用时收敛为 k_final）
+    k_rerank: usize,
+    /// 每个通道的取回条数、以及 RRF 融合后的保留条数
+    k_recall: usize,
+}
+
+impl SearchBudget {
+    fn new(
+        k_final: usize,
+        config: &HybridSearchConfig,
+        reranker: Option<&RerankerService>,
+    ) -> Self {
+        // 精排真正启用时才放大精排池；multiplier 至少按 1 计，避免配成 0 时池子被
+        // 压成 0 条（那等于静默跳过精排，却不给出任何提示）。
+        let multiplier = match reranker {
+            Some(r) if r.config().enabled => r.config().candidate_multiplier.max(1),
+            _ => 1,
+        };
+        // saturating_mul 防止 limit 极大时溢出
+        let k_rerank = k_final.saturating_mul(multiplier).max(k_final);
+        // 通道配置值是 K_recall 的下界：既保留原有召回规模，又保证不短于精排池
+        let k_recall = config.dense_limit.max(config.sparse_limit).max(k_rerank);
+        Self {
+            k_final,
+            k_rerank,
+            k_recall,
+        }
+    }
+}
+
+/// 用**完整原始候选集**把已排序结果补齐到 `k_final` 条。
+///
+/// 精排池只是召回集的前缀，池外尾部同样是合法候选；精排返回不足（正文缺失导致无
+/// 法打分、服务端漏返回、候选总数本就不足）时，按完整候选集的原顺序继续补，绝不
+/// 让最终结果短于「候选集本身能提供的条数」。按 `snippet_id` 去重，避免池内外重叠
+/// 造成重复条目。返回实际补齐的条数。
+fn fill_from_complete_set(
+    ranked: &mut Vec<FusedCandidate>,
+    complete: &[FusedCandidate],
+    k_final: usize,
+) -> usize {
+    if ranked.len() >= k_final {
+        return 0;
+    }
+
+    let mut seen: HashSet<String> = ranked.iter().map(|c| c.snippet_id.clone()).collect();
+    let mut filled = 0usize;
+
+    for candidate in complete {
+        if ranked.len() >= k_final {
+            break;
+        }
+        // insert 返回 false 表示该 snippet_id 已在结果里（池内已打分，或重复候选）
+        if seen.insert(candidate.snippet_id.clone()) {
+            ranked.push(candidate.clone());
+            filled += 1;
+        }
+    }
+
+    filled
+}
+
+/// `final_score` 所属的分数域 —— 归一化到 `rel ∈ [0, 1]` 的唯一入口。
+///
+/// [`HybridSearchService::search`] 有 4 条产出路径，四者的 `final_score` 量纲完全不同，
+/// **绝对阈值绝不能直接打在 `final_score` 上**：
+///
+/// | 路径 | 分数 | 典型量级 |
+/// |---|---|---|
+/// | 主路径 RRF 融合 | `Σ 1/(rrf_k + rank + 1)` | 单通道 ≈0.0164、双通道 ≈0.0328 |
+/// | Reranker 池内命中 | cross-encoder sigmoid 概率 | ≈[0, 1] |
+/// | dense-only 降级 | `1/(1+distance)` | ≈[0, 1] |
+/// | sparse-only 降级 | BM25 原始分 | 无上界 |
+#[derive(Debug, Clone, Copy)]
+enum ScoreDomain {
+    /// RRF 融合域。`max_possible = channels / (rrf_k + 1)`，其中 `channels` 是**实际参与
+    /// 融合且有非空结果**的通道数（至少取 1），故双通道 top1 归一化为 1.0、单通道
+    /// top1 归一化为 0.5。
+    Rrf { max_possible: f64 },
+    /// dense-only 降级域（`1/(1+distance)`，本身已在 [0, 1] 附近）。
+    DenseSim,
+    /// sparse-only 降级域。`top` 为该候选列表首条（最高）BM25 原始分，用作归一化分母。
+    Bm25Raw { top: f64 },
+    /// cross-encoder 概率域（sigmoid 输出，已在 [0, 1]）。
+    Rerank,
+}
+
+impl ScoreDomain {
+    /// 域名称，仅用于日志。
+    fn name(&self) -> &'static str {
+        match self {
+            ScoreDomain::Rrf { .. } => "Rrf",
+            ScoreDomain::DenseSim => "DenseSim",
+            ScoreDomain::Bm25Raw { .. } => "Bm25Raw",
+            ScoreDomain::Rerank => "Rerank",
+        }
+    }
+
+    /// 把本域的原始分数映射到可比较的 `rel ∈ [0, 1]`。
+    ///
+    /// 非有限输入（`NaN` / `±Inf`）一律返回 `0.0`，并由调用侧（[`adaptive_cutoff`]）
+    /// 汇总 warn 一次 —— 这样脏分数只会被「丢弃」，不会污染排序也不会 panic。
+    fn to_relevance(self, score: f64) -> f64 {
+        if !score.is_finite() {
+            return 0.0;
+        }
+        match self {
+            // max_possible 由调用方保证 > 0；这里仍做一次防御，避免除以 0 得到 inf
+            ScoreDomain::Rrf { max_possible } => {
+                if max_possible > 0.0 {
+                    (score / max_possible).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            ScoreDomain::DenseSim | ScoreDomain::Rerank => score.clamp(0.0, 1.0),
+            // BM25 原始分无上界：以本批最高分为分母做 min-max 上界归一化
+            ScoreDomain::Bm25Raw { top } => {
+                if top > 0.0 {
+                    (score / top).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+/// 自适应 cutoff 的触发者（哪道闸门决定了最终长度）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CutoffTrigger {
+    /// 未被任何闸门裁剪（或裁剪后长度仍等于有效长度）。
+    #[default]
+    None,
+    /// 闸门一：绝对下限（硬闸）
+    AbsoluteFloor,
+    /// 闸门二：相对比例
+    RelativeRatio,
+    /// 闸门三：断层检测
+    ScoreGap,
+    /// 配置关闭，仅按 `k_final` 截断
+    Disabled,
+}
+
+/// 一次自适应 cutoff 的观测报告（仅用于日志与单测断言）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CutoffReport {
+    /// 施加前条数
+    before: usize,
+    /// 施加后条数
+    after: usize,
+    /// 实际生效的闸门
+    trigger: CutoffTrigger,
+    /// 闸门一通过的前缀长度
+    len_abs: usize,
+    /// 闸门二通过的前缀长度
+    len_ratio: usize,
+    /// 闸门三通过的前缀长度
+    len_gap: usize,
+}
+
+/// 自适应 cutoff：分数域归一化 + 三闸门级联前缀截断。
+///
+/// 纯函数（不依赖 `self`），便于单测。**只做前缀截断**，绝不中间挖洞；`final_score`
+/// 字段本身不被改写，归一化只作用于内部的 `rel` 向量。
+///
+/// 三闸门的硬/软语义：
+/// - 闸门一（[`AdaptiveCutoffConfig::abs_floor`]）是**硬闸**：`rel <= abs_floor` 即截断，
+///   且它同时限制 `min_keep` 的保底上限；
+/// - 闸门二（`rel_ratio` / `rel_ratio_rrf`）是**软闸**：只与头部分数比较相对落差；
+/// - 闸门三（`gap_min`）是**软闸**：只看相邻项的相对跌幅，识别「断崖」。
+///
+/// 顺序是 `绝对下限 → 相对比例 → 断层检测 → 保底`：先剔除「根本不合格」的尾部，再比较
+/// 相对落差，最后才做断崖识别，这样后两者永远只在闸门一允许的前缀内工作。
+fn adaptive_cutoff(
+    candidates: &mut Vec<FusedCandidate>,
+    domain: ScoreDomain,
+    cfg: &AdaptiveCutoffConfig,
+    k_final: usize,
+) -> CutoffReport {
+    let before = candidates.len();
+
+    // ---- Step 0：早退 ----
+    if candidates.is_empty() {
+        return CutoffReport {
+            before: 0,
+            after: 0,
+            trigger: CutoffTrigger::None,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+    if !cfg.enabled {
+        candidates.truncate(k_final);
+        let after = candidates.len();
+        debug!(
+            "自适应 cutoff 已关闭：{} → {} 条（仅按 k_final={} 截断）",
+            before, after, k_final
+        );
+        return CutoffReport {
+            before,
+            after,
+            trigger: CutoffTrigger::Disabled,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+
+    // ---- Step 1：计算 rel（归一化后的可比分数） ----
+    let mut non_finite = 0usize;
+    let rel: Vec<f64> = candidates
+        .iter()
+        .map(|c| {
+            if !c.final_score.is_finite() {
+                non_finite += 1;
+            }
+            domain.to_relevance(c.final_score)
+        })
+        .collect();
+    if non_finite > 0 {
+        warn!(
+            "自适应 cutoff：{} 域有 {} 条候选分数非有限（NaN/Inf），按 rel=0 处理",
+            domain.name(),
+            non_finite
+        );
+    }
+
+    // ---- Step 2：按 rel 稳定降序重排 ----
+    // 必须重排：`apply_rerank` 成功分支先 truncate 再 fill_from_complete_set，补进来的
+    // 未打分 RRF 候选被追加到末尾，其 final_score（最高 2/(k+1)）可能大于池内某些
+    // rerank 低分，于是返回 Vec 并非严格降序。前缀截断算法必须建立在单调序列上。
+    // 用 std::mem::take 搬移而非 clone；sort_by 是稳定排序。
+    let taken = std::mem::take(candidates);
+    let mut paired: Vec<(f64, FusedCandidate)> = rel.into_iter().zip(taken).collect();
+    paired.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ---- Step 3：有效长度（永不超过最终预算） ----
+    let n = paired.len().min(k_final);
+
+    // ---- Step 4：闸门一 —— 绝对下限（硬闸，严格大于才通过） ----
+    // 用 `>` 而非 `>=`：用户示例 [0.85, 0.81, 0.7, 0.2] 中 0.2 必须被丢掉。
+    let mut len_abs = 0usize;
+    for (i, (rel, _)) in paired.iter().enumerate().take(n) {
+        if *rel > cfg.abs_floor {
+            len_abs = i + 1;
+        } else {
+            break;
+        }
+    }
+    if len_abs == 0 {
+        // candidates 已被 mem::take 掏空，直接返回即「清空」语义
+        debug!(
+            "自适应 cutoff：{} 域全部 {} 条候选 rel <= abs_floor={}，结果清空",
+            domain.name(),
+            before,
+            cfg.abs_floor
+        );
+        return CutoffReport {
+            before,
+            after: 0,
+            trigger: CutoffTrigger::AbsoluteFloor,
+            len_abs: 0,
+            len_ratio: 0,
+            len_gap: 0,
+        };
+    }
+
+    // ---- Step 5：闸门二 —— 相对比例（软闸） ----
+    // RRF 域用独立的 rel_ratio_rrf：RRF 只有离散档位，用连续域比例会误伤单通道命中。
+    let ratio = match domain {
+        ScoreDomain::Rrf { .. } => cfg.rel_ratio_rrf,
+        _ => cfg.rel_ratio,
+    }
+    .clamp(0.0, 1.0);
+    let bound = ratio * paired[0].0;
+    let mut len_ratio = 0usize;
+    for (i, (rel, _)) in paired.iter().enumerate().take(len_abs) {
+        if *rel >= bound {
+            len_ratio = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // ---- Step 6：闸门三 —— 断层检测（软闸，仅连续分数域） ----
+    // RRF 域**完全跳过**：RRF 分数是离散档位（双通道归一化后 1.0、单通道 0.5），
+    // 相邻档位的相对跌幅恒为 0.5，只要 gap_min < 0.5 就会在「双通道 → 单通道」边界
+    // 上触发，退化成「砍掉所有单通道命中」—— 这是错误语义，而非「断崖」。因此
+    // RRF 域把 len_gap 直接设为 len_ratio。
+    let mut len_gap = len_ratio;
+    let mut gap_hit = false;
+    if !matches!(domain, ScoreDomain::Rrf { .. }) {
+        for i in 0..len_ratio {
+            if i + 1 >= len_ratio {
+                break;
+            }
+            let cur = paired[i].0;
+            let next = paired[i + 1].0;
+            if cur > 0.0 && (cur - next) / cur >= cfg.gap_min {
+                len_gap = i + 1;
+                gap_hit = true;
+                break;
+            }
+        }
+    }
+
+    // ---- Step 7：保底与收尾 ----
+    // 保底上限被闸门一钳住：min_keep 再大也绝不突破绝对下限这道硬闸。
+    let final_len = len_gap.max(cfg.min_keep.min(len_abs));
+    let mut trigger = CutoffTrigger::None;
+    if len_abs < n {
+        trigger = CutoffTrigger::AbsoluteFloor;
+    }
+    if len_ratio < n && len_ratio < len_abs {
+        trigger = CutoffTrigger::RelativeRatio;
+    }
+    if gap_hit {
+        trigger = CutoffTrigger::ScoreGap;
+    }
+    if final_len >= n {
+        // 长度最终没有被压到有效长度以下（含 min_keep 抬回的情形）⇒ 视为未裁剪
+        trigger = CutoffTrigger::None;
+    }
+
+    let dropped = if final_len < paired.len() {
+        // 降序序列：丢弃区间是 paired[final_len..]，首为其中最大、尾为最小
+        (paired[final_len].0, paired[paired.len() - 1].0)
+    } else {
+        (0.0, 0.0)
+    };
+
+    paired.truncate(final_len);
+    *candidates = paired.into_iter().map(|(_, c)| c).collect();
+    let after = candidates.len();
+
+    debug!(
+        "自适应 cutoff：{} 域 {} → {} 条（trigger={:?}, abs={}, ratio={}, gap={}, 丢弃 rel 区间 [{:.4}, {:.4}]）",
+        domain.name(),
+        before,
+        after,
+        trigger,
+        len_abs,
+        len_ratio,
+        len_gap,
+        dropped.0,
+        dropped.1
+    );
+
+    CutoffReport {
+        before,
+        after,
+        trigger,
+        len_abs,
+        len_ratio,
+        len_gap,
+    }
 }
 
 impl HybridSearchService {
@@ -104,7 +680,12 @@ impl HybridSearchService {
         sparse: Arc<dyn TextSearchProvider>,
         config: HybridSearchConfig,
     ) -> Self {
-        Self { dense, sparse, config, reranker: None }
+        Self {
+            dense,
+            sparse,
+            config,
+            reranker: None,
+        }
     }
 
     /// Create a new hybrid search service with optional reranker.
@@ -114,106 +695,363 @@ impl HybridSearchService {
         config: HybridSearchConfig,
         reranker: Option<RerankerService>,
     ) -> Self {
-        Self { dense, sparse, config, reranker }
+        Self {
+            dense,
+            sparse,
+            config,
+            reranker,
+        }
     }
 
     /// Execute hybrid search: query both channels, fuse results via RRF.
     ///
     /// # Arguments
     /// * `query` - The search query string
-    /// * `limit` - Number of final results to return
+    /// * `limit` - 最终返回条数（`K_final`）；`0` 直接返回空结果
     ///
     /// # Returns
     /// A vector of `FusedCandidate` sorted by fused RRF score (descending).
-    /// If sparse channel is disabled or unavailable, falls back to dense-only.
+    ///
+    /// # 检索预算阶梯（不变式：`K_recall >= K_rerank >= K_final`）
+    ///
+    /// 三档预算由 [`SearchBudget::new`] 一次性推导，其余位置只读该结构，不再各自演算：
+    ///
+    /// - `K_final` = 调用方传入的 `limit`：最终返回条数；
+    /// - `K_rerank` = `K_final × candidate_multiplier`（multiplier 至少按 1 计，reranker
+    ///   未启用时直接收敛为 `K_final`）：送入 cross-encoder 的候选池大小；
+    /// - `K_recall` = `max(dense_limit, sparse_limit, K_rerank)`：每个通道的取回条数，
+    ///   同时也是 RRF 融合后的保留条数（配置值只是它的下界）。
+    ///
+    /// 精排结果不足 `K_final` 时，补齐来源是**完整原始候选集**（而非仅精排池外的尾部），
+    /// 按 `snippet_id` 去重，见 [`fill_from_complete_set`]。
+    ///
+    /// 降级阶梯（两通道对称，任一条通道存活即出结果）：
+    /// - dense 失败 + sparse 可用 → sparse-only 候选（`Self::sparse_only_candidates`）
+    /// - sparse 禁用或失败 + dense 可用 → dense-only 候选（`Self::dense_only_candidates`）
+    /// - dense 失败且 sparse 被禁用 / 也失败 → 返回 `Err`，由调用方回退到
+    ///   PetCodeGraph 名称搜索（见 `main.rs` 的 `use_graph_fallback`）
+    ///
+    /// 降级路径**不执行 RRF**：存活通道的候选缺少可比较的另一侧分数。是否执行
+    /// Reranker 则取决于正文是否可得：
+    /// - sparse-only 降级：BM25 不存正文，但候选会先经 [`Self::hydrate_code_blocks`]
+    ///   从源文件回填 `code_block`；正文补上后「cross-encoder 无文本可打分」这个原本
+    ///   跳过精排的理由消失，因此**会**执行 rerank；
+    /// - dense-only 降级：正文由 dense 通道自带，但没有另一侧分数可融合，降级语义
+    ///   保持为「原样输出、不重排」。
+    ///
+    /// 融合主路径同样先回填正文再进 reranker：`SparseOnly` 候选（以及缺正文的
+    /// `Fused` 候选）在精排输入与最终证据里都必须是带正文的。
+    ///
+    /// # 自适应 cutoff（返回前的最后一道关卡）
+    ///
+    /// 预算阶梯只回答「最多能返回几条」，cutoff 回答「这几条里到底哪几条真的值得返回」。
+    /// 四条产出路径的 `final_score` 分属**四个分数域**，绝对值互相不可比：
+    ///
+    /// | 产出路径 | 分数域 | 典型量级 |
+    /// |---|---|---|
+    /// | 主路径 RRF 融合 | [`ScoreDomain::Rrf`] `Σ 1/(rrf_k+rank+1)` | 单通道 ≈0.0164 / 双通道 ≈0.0328 |
+    /// | Reranker 池内命中 | [`ScoreDomain::Rerank`] sigmoid 概率 | ≈[0, 1] |
+    /// | dense-only 降级 | [`ScoreDomain::DenseSim`] `1/(1+distance)` | ≈[0, 1] |
+    /// | sparse-only 降级 | [`ScoreDomain::Bm25Raw`] BM25 原始分 | 无上界 |
+    ///
+    /// 因此**绝不能**把绝对阈值直接打在 `final_score` 上：0.2 的阈值会让 RRF 结果全灭、
+    /// 却对 BM25 毫无约束。所有阈值一律作用在 [`ScoreDomain::to_relevance`] 归一化后的
+    /// `rel ∈ [0,1]` 上，`final_score` 字段本身保持原值（调用方会打印、JSON 也会透传）。
+    ///
+    /// 三闸门按 `绝对下限 → 相对比例 → 断层检测 → 保底` 级联，且**只做前缀截断**
+    /// （绝不中间挖洞）：
+    /// - 闸门一是**硬闸**：`rel <= abs_floor` 即截断，`min_keep` 也不能突破它；
+    /// - 闸门二、三是**软闸**：分别按「与 top1 的相对落差」「相邻项的相对跌幅」裁剪。
+    ///
+    /// [`ScoreDomain::Rrf`] 域**跳过**闸门三：RRF 分数是离散档位（双通道 1.0、单通道
+    /// 0.5 归一化后），相邻档位相对跌幅恒为 0.5，断层检测会退化成「砍掉所有单通道
+    /// 命中」的错误语义。RRF 域另有独立的 `rel_ratio_rrf` 兜底（默认 0.40 < 0.5），
+    /// 保证单通道命中不会被相对比例闸门一刀切掉，结果是**永不因绝对阈值清空**。
+    ///
+    /// cutoff 与 [`fill_from_complete_set`] 的先后关系固定为「先补满、再裁剪」：
+    /// 精排不足时先补齐到 `K_final`，随后 cutoff 才做裁决，补进来的未打分候选
+    /// `rel = 0` 会被绝对下限自然丢弃。**cutoff 之后绝不再补齐** —— 否则又会长回
+    /// 被裁掉的低分尾部，cutoff 语义被破坏。
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<FusedCandidate>> {
-        if query.is_empty() {
+        if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
-        let dense_limit = self.config.dense_limit.max(limit);
+        // 三档预算一次性推导，后续只读 budget，不再各自演算
+        let budget = SearchBudget::new(limit, &self.config, self.reranker.as_ref());
+        debug!(
+            "Hybrid search budget: k_final={}, k_rerank={}, k_recall={}",
+            budget.k_final, budget.k_rerank, budget.k_recall
+        );
+
+        let dense_limit = budget.k_recall;
         let sparse_limit = if self.config.enable_sparse {
-            self.config.sparse_limit.max(limit)
+            budget.k_recall
         } else {
             0
         };
 
-        // Dispatch both channels in parallel
-        let dense_future = self.dense.search(query, dense_limit);
-        let sparse_future = if self.config.enable_sparse {
-            Some(Box::pin(self.sparse.search(query, sparse_limit)))
+        // Dispatch both channels concurrently: `tokio::join!` polls both futures in
+        // the same task, so the sparse (BM25) query no longer waits for the dense
+        // (vector) query to finish before it even starts.
+        let (dense_res, sparse_res_opt) = if self.config.enable_sparse {
+            let (dense_res, sparse_res) = tokio::join!(
+                self.dense.search(query, dense_limit),
+                self.sparse.search(query, sparse_limit)
+            );
+            (dense_res, Some(sparse_res))
         } else {
-            None
+            debug!("Sparse channel disabled in config");
+            (self.dense.search(query, dense_limit).await, None)
         };
 
-        let dense_res = dense_future.await;
-
-        // Handle sparse results with graceful degradation
-        let sparse_res_opt = match sparse_future {
-            Some(fut) => Some(fut.await),
-            None => {
-                debug!("Sparse channel disabled in config");
-                None
+        // 两通道结果对称处理：任一条通道存活即出结果，只有两条都不可用时才整体失败。
+        // 同时记录「实际参与融合且有非空结果」的通道数 `rrf_channels` —— 它是 RRF 域
+        // 归一化分母的唯一依据（`max_possible = channels / (rrf_k + 1)`），因此必须在
+        // dense / sparse 被 move 进融合函数之前用 `is_empty()` 取出。
+        let (mut fused, rrf_channels): (Vec<FusedCandidate>, usize) =
+            match (dense_res, sparse_res_opt) {
+            (Ok(dense), Some(Ok(sparse))) => {
+                debug!("Sparse channel returned {} results", sparse.len());
+                let channels = usize::from(!dense.is_empty()) + usize::from(!sparse.is_empty());
+                // Perform RRF fusion — 保留条数取 K_recall，保证不短于精排池与最终预算
+                let fused = self.reciprocal_rank_fusion(dense, sparse, budget.k_recall);
+                // 两通道皆空时仍按 1 计，避免归一化分母为 0
+                (fused, channels.max(1))
             }
-        };
-
-        // Dense results are required — if they fail, the whole search fails
-        let dense_raw = dense_res.map_err(|e| {
-            anyhow!("Dense (vector) search failed: {}", e)
-        })?;
-
-        // Handle sparse results with graceful degradation
-        let sparse_results: Option<Vec<TextSearchResult>> = match sparse_res_opt {
-            None => {
-                debug!("Sparse channel disabled in config");
-                None
-            }
-            Some(Ok(results)) => {
-                debug!("Sparse channel returned {} results", results.len());
-                Some(results)
-            }
-            Some(Err(e)) => {
+            (Ok(dense), Some(Err(e))) => {
                 warn!(
                     "Sparse (BM25) channel failed, falling back to dense-only: {}",
                     e
                 );
-                // Return dense results as dense-only candidates
-                return Ok(
-                    dense_raw
-                        .into_iter()
-                        .map(|sr| FusedCandidate {
-                            snippet_id: format!("{}#{}", sr.file_path, sr.symbol_name),
-                            final_score: sr.score as f64,
-                            file_path: sr.file_path,
-                            symbol_name: sr.symbol_name,
-                            language: String::new(),
-                            line_start: 0,
-                            line_end: 0,
-                            code_block: sr.code_block,
-                            source: CandidateSource::DenseOnly,
-                        })
-                        .take(limit)
-                        .collect(),
+                // 降级：不施加 RRF / 短代码惩罚，也不进 reranker。
+                // dense 候选的正文自带，无需 hydrate_code_blocks，降级语义保持不变。
+                // 分数域是向量相似度（`1/(1+distance)`，约 [0,1]）⇒ 按 DenseSim 归一化
+                // 后做自适应 cutoff，取代单纯的 truncate。
+                let mut candidates = Self::dense_only_candidates(dense, budget.k_final);
+                adaptive_cutoff(
+                    &mut candidates,
+                    ScoreDomain::DenseSim,
+                    &self.config.cutoff,
+                    budget.k_final,
                 );
+                return Ok(candidates);
+            }
+            (Ok(dense), None) => {
+                // sparse 被禁用：空 sparse 走 fusion，等价于融合后的 dense-only 排序。
+                // 只有 dense 一条通道参与融合，故 channels 恒为 1。
+                (
+                    self.reciprocal_rank_fusion(dense, Vec::new(), budget.k_recall),
+                    1,
+                )
+            }
+            (Err(dense_e), Some(Ok(sparse))) => {
+                warn!(
+                    "Dense (vector) channel failed, falling back to sparse-only (BM25): {}",
+                    dense_e
+                );
+                // 降级：先用完整 BM25 池构造候选（上限取池长度，避免回填前就被 limit
+                // 截断），回填正文后再决定是否精排 —— 正文补上后「cross-encoder 无文本
+                // 可打分」这个原本跳过 reranker 的理由不再成立。
+                // 完整池同时是精排不足时唯一的补齐来源，因此这里不预先裁剪。
+                let pool_len = sparse.len();
+                let mut candidates = Self::sparse_only_candidates(sparse, pool_len);
+                // BM25 原始分无上界，必须以本批最高分（首条，列表按 BM25 排序）作归一化
+                // 分母；列表为空时 top = 0.0（归一化后全为 0，会被绝对下限清空）。
+                let bm25_domain = ScoreDomain::Bm25Raw {
+                    top: candidates.first().map(|c| c.final_score).unwrap_or(0.0),
+                };
+                Self::hydrate_code_blocks(&mut candidates).await;
+
+                if let Some(ref reranker) = self.reranker {
+                    if reranker.config().enabled {
+                        // 精排成功走 Rerank 域、失败回退走 bm25_domain，均由 apply_rerank
+                        // 内部统一施加 cutoff（并保证 cutoff 之后不再补齐）
+                        return self
+                            .apply_rerank(reranker, query, candidates, budget, bm25_domain)
+                            .await;
+                    }
+                }
+                // 无 reranker：cutoff 取代原来单纯的 truncate(k_final)
+                adaptive_cutoff(
+                    &mut candidates,
+                    bm25_domain,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
+                return Ok(candidates);
+            }
+            (Err(dense_e), Some(Err(sparse_e))) => {
+                // 两条通道都不可用 → 聚合 Err，由调用方回退到 PetCodeGraph 名称搜索
+                return Err(anyhow!(
+                    "Hybrid search failed: dense (vector) channel: {}; sparse (BM25) channel: {}",
+                    dense_e,
+                    sparse_e
+                ));
+            }
+            (Err(e), None) => {
+                // 唯一通道（dense）失败且无备用通道 → 只能整体失败
+                return Err(anyhow!(
+                    "Dense (vector) search failed and sparse channel is disabled: {}",
+                    e
+                ));
             }
         };
 
-        // Perform RRF fusion — 返回足够的候选供后续 rerank 使用
-        let rrf_limit = self.config.dense_limit.max(self.config.sparse_limit);
-        let fused = self.reciprocal_rank_fusion(dense_raw, sparse_results.unwrap_or_default(), rrf_limit);
-        debug!("Hybrid search returned {} fused candidates (before rerank)", fused.len());
+        debug!(
+            "Hybrid search returned {} fused candidates (before rerank)",
+            fused.len()
+        );
+
+        // BM25 通道的 content 非 STORED，`SparseOnly` 候选天然没有正文：进 reranker 前
+        // 必须先在磁盘上补齐，否则 cross-encoder 收到空 document、最终证据也是空的
+        Self::hydrate_code_blocks(&mut fused).await;
 
         // Phase 2: Optional Cross-Encoder Rerank
+        // 主路径的分数域恒为 RRF：`max_possible = channels / (rrf_k + 1)`。双通道时
+        // top1 归一化为 1.0，单通道（sparse 被禁用）时归一化为 0.5 —— 注意此时绝对
+        // 下限 0.2 仍会让 0.5 通过，故单通道 RRF 结果不会被绝对阈值清空。
+        let rrf_domain = ScoreDomain::Rrf {
+            max_possible: rrf_channels as f64 / (self.config.rrf_k + 1.0),
+        };
+
         if let Some(ref reranker) = self.reranker {
             if reranker.config().enabled {
-                return self.apply_rerank(reranker, query, fused, limit).await;
+                return self
+                    .apply_rerank(reranker, query, fused, budget, rrf_domain)
+                    .await;
             }
         }
 
-        // 无 rerank 时截断到 limit
+        // 无 rerank 时按 RRF 域做自适应 cutoff（有效长度先被 k_final 收窄）
         let mut result = fused;
-        result.truncate(limit);
+        adaptive_cutoff(
+            &mut result,
+            rrf_domain,
+            &self.config.cutoff,
+            budget.k_final,
+        );
         Ok(result)
+    }
+
+    /// 为缺少正文的候选从源文件回填代码片段。
+    ///
+    /// BM25 通道的 content 字段非 STORED，`SparseOnly` 候选天然没有正文；不补的话
+    /// cross-encoder 收到空 document、最终证据也是空的。同一 `file_path` 只读一次；
+    /// 读取失败/行号不可用时保持原样并 warn，绝不影响整体搜索。
+    ///
+    /// 只处理「正文为空 + 行号可用 + 路径非空」的候选（dense 自带的正文是权威数据，
+    /// 绝不覆盖）。不返回 `Result`：回填是尽力而为的增强，失败退化为修复前的行为。
+    async fn hydrate_code_blocks(candidates: &mut [FusedCandidate]) {
+        // 按文件归组待回填候选的下标：一个文件可能命中多个符号，没必要重复读盘
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, c) in candidates.iter().enumerate() {
+            if c.code_block.trim().is_empty() && c.line_start > 0 && !c.file_path.is_empty() {
+                by_file.entry(c.file_path.clone()).or_default().push(idx);
+            }
+        }
+        if by_file.is_empty() {
+            return;
+        }
+
+        let mut hydrated = 0usize;
+        let mut failed_files = 0usize;
+
+        for (path, indices) in by_file {
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(e) => {
+                    // 索引可能比工作区旧（文件已删/已改路径），只降级不失败
+                    warn!("BM25 正文回填跳过 {}：{}", path, e);
+                    failed_files += 1;
+                    continue;
+                }
+            };
+
+            for idx in indices {
+                let (line_start, line_end) = {
+                    let c = &candidates[idx];
+                    (c.line_start, c.line_end)
+                };
+                match slice_code_lines(&content, line_start, line_end, BM25_BACKFILL_MAX_LINES) {
+                    Some((snippet, real_end)) => {
+                        let c = &mut candidates[idx];
+                        c.code_block = snippet;
+                        // BM25 通道原本没有结束行（0），回填后写入真实结束行
+                        if c.line_end == 0 {
+                            c.line_end = real_end;
+                        }
+                        hydrated += 1;
+                    }
+                    None => {
+                        debug!(
+                            "BM25 正文回填无有效片段：{}:{}（行号越界或该区间全为空白）",
+                            path, line_start
+                        );
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "BM25 正文回填完成：成功 {} 条，读取失败文件 {} 个",
+            hydrated, failed_files
+        );
+    }
+
+    /// 降级：仅 dense 通道可用时，把向量命中原样转成候选（不施加 RRF / 短代码惩罚）。
+    ///
+    /// 用于 sparse (BM25) 通道禁用之外的失败场景。顺序沿用 dense 通道自身的相似度
+    /// 排序，`final_score` 直接取向量分数，因此**不进 reranker**（另一侧分数缺失，
+    /// 融合与精排都没有可比对象）。纯函数，不依赖 `self`，便于单测。
+    fn dense_only_candidates(dense: Vec<SearchResult>, limit: usize) -> Vec<FusedCandidate> {
+        dense
+            .into_iter()
+            .map(|sr| FusedCandidate {
+                snippet_id: dense_snippet_id(&sr),
+                final_score: sr.score as f64,
+                file_path: sr.file_path,
+                symbol_name: sr.symbol_name,
+                language: sr.language,
+                line_start: sr.line_start,
+                line_end: sr.line_end,
+                code_block: sr.code_block,
+                source: CandidateSource::DenseOnly,
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// 降级：仅 sparse (BM25) 通道可用时，把 BM25 命中原样转成候选。
+    ///
+    /// BM25 不存储正文（schema 里 content 非 STORED），故 `code_block` 为空、
+    /// `line_end` 为 0；行号优先取 provider 已填充的 `line_start`，否则从
+    /// `snippet_id` 反解（见 [`sparse_line_start`]）。顺序沿用 BM25 相关性排序，
+    /// `final_score` 直接取 BM25 分数。
+    ///
+    /// 空 `code_block` 与 `line_end == 0` 只是**构造时**的状态：正文由调用侧的
+    /// [`HybridSearchService::hydrate_code_blocks`] 从源文件回填，并顺带补上真实的
+    /// `line_end`。因此本函数保持纯函数、不依赖 `self`，便于单测。
+    fn sparse_only_candidates(sparse: Vec<TextSearchResult>, limit: usize) -> Vec<FusedCandidate> {
+        sparse
+            .into_iter()
+            .map(|sr| {
+                // 行号必须在任何字段被 move 之前求出（snippet_id 里带着真实行号）
+                let line_start = sparse_line_start(&sr);
+                FusedCandidate {
+                    snippet_id: sr.snippet_id.clone(),
+                    final_score: sr.score as f64,
+                    file_path: sr.file_path,
+                    symbol_name: sr.symbol_name,
+                    language: sr.language,
+                    line_start,
+                    line_end: 0,
+                    code_block: String::new(),
+                    source: CandidateSource::SparseOnly,
+                }
+            })
+            .take(limit)
+            .collect()
     }
 
     /// Reciprocal Rank Fusion (RRF) for combining ranked lists.
@@ -223,37 +1061,95 @@ impl HybridSearchService {
     /// in a ranked list, and the sum is over all channels that returned d.
     ///
     /// Documents appearing in both channels get a higher fused score.
+    ///
+    /// 两个通道的 id 统一由 [`CodeChunk::generate_id`] 生成（三段式
+    /// `{file_path}#{line_start}#{symbol_name}`），因此「只被 BM25 命中」的片段
+    /// 也会作为 `CandidateSource::SparseOnly` 候选保留，不再被静默丢弃。
     fn reciprocal_rank_fusion(
         &self,
         dense: Vec<SearchResult>,
         sparse: Vec<TextSearchResult>,
         limit: usize,
     ) -> Vec<FusedCandidate> {
-        let k = self.config.rrf_k;
+        Self::fuse(dense, sparse, &self.config, limit)
+    }
 
-        // Accumulate scores per snippet_id, along with metadata
+    /// Pure RRF fusion core.
+    ///
+    /// 只依赖入参与 `config`（不触碰 `self.dense` / `self.sparse`），因此无需构造
+    /// EmbeddingService 或 Tantivy 索引即可单测。
+    fn fuse(
+        dense: Vec<SearchResult>,
+        sparse: Vec<TextSearchResult>,
+        config: &HybridSearchConfig,
+        limit: usize,
+    ) -> Vec<FusedCandidate> {
+        let k = config.rrf_k;
+
+        // Accumulate scores per snippet_id, along with metadata from whichever
+        // channel(s) produced it. ids 记录在 set 里，供后面判定候选来源。
         let mut score_map: HashMap<String, f64> = HashMap::new();
-        let mut meta_map: HashMap<String, DenseMeta> = HashMap::new();
+        let mut meta_map: HashMap<String, FusionMeta> = HashMap::new();
+        let mut dense_ids: HashSet<String> = HashSet::new();
+        let mut sparse_ids: HashSet<String> = HashSet::new();
 
-        // Process dense channel
-        for (rank, dr) in dense.iter().enumerate() {
-            let snippet_id = format!("{}#{}", dr.file_path, dr.symbol_name);
-            let rrf_score = 1.0 / (k + rank as f64 + 1.0);
-            *score_map.entry(snippet_id.clone()).or_insert(0.0) += rrf_score;
-            meta_map.entry(snippet_id).or_insert_with(|| DenseMeta::from(dr));
-        }
-
-        // Process sparse channel — fill in line_start from sparse results
+        // Process sparse channel FIRST — 纯 BM25 命中本身就是合法候选，并且只有它的
+        // snippet_id 携带真实行号（Tantivy schema 未存 line_start 字段）。遍历时顺带
+        // 建立 (file_path, symbol_name) → line_start 映射，供行号缺失的 dense 结果回填。
+        let mut sparse_line_by_symbol: HashMap<(String, String), usize> = HashMap::new();
         for (rank, sr) in sparse.iter().enumerate() {
             let rrf_score = 1.0 / (k + rank as f64 + 1.0);
             *score_map.entry(sr.snippet_id.clone()).or_insert(0.0) += rrf_score;
 
-            // If sparse has line info but dense doesn't, merge it
-            if let Some(meta) = meta_map.get_mut(&sr.snippet_id) {
-                if meta.line_start == 0 && sr.line_start > 0 {
-                    meta.line_start = sr.line_start;
+            let sparse_meta = FusionMeta::from(sr);
+            let meta = meta_map
+                .entry(sr.snippet_id.clone())
+                .or_insert_with(|| sparse_meta.clone());
+            meta.merge_missing(&sparse_meta);
+
+            // 只记录非 0 行号，同 (file, symbol) 取第一次出现的值
+            if sparse_meta.line_start > 0 {
+                sparse_line_by_symbol
+                    .entry((
+                        sparse_meta.file_path.clone(),
+                        sparse_meta.symbol_name.clone(),
+                    ))
+                    .or_insert(sparse_meta.line_start);
+            }
+
+            sparse_ids.insert(sr.snippet_id.clone());
+        }
+
+        // Process dense channel — 旧 LanceDB 表缺 line_start 列时行号为 0，先按
+        // (file, symbol) 从 sparse 回填，再用回填后的行号重算 snippet_id。否则
+        // dense 侧的 `{file}#0#{sym}` 与 BM25 侧真实 id 永不相等，RRF 既不能合并
+        // 分数，也会多出一条行号为 0 的重复候选。
+        for (rank, dr) in dense.iter().enumerate() {
+            let mut dense_meta = FusionMeta::from(dr);
+            if dense_meta.line_start == 0 {
+                if let Some(line) = sparse_line_by_symbol
+                    .get(&(dense_meta.file_path.clone(), dense_meta.symbol_name.clone()))
+                {
+                    dense_meta.line_start = *line;
                 }
             }
+            let snippet_id = CodeChunk::generate_id(
+                &dense_meta.file_path,
+                dense_meta.line_start,
+                &dense_meta.symbol_name,
+            );
+
+            let rrf_score = 1.0 / (k + rank as f64 + 1.0);
+            *score_map.entry(snippet_id.clone()).or_insert(0.0) += rrf_score;
+
+            // sparse meta 已是基底（携带真实行号），merge_missing 只补它缺的
+            // code_block / line_end / language，不会用 0 覆盖真实行号
+            let meta = meta_map
+                .entry(snippet_id.clone())
+                .or_insert_with(|| dense_meta.clone());
+            meta.merge_missing(&dense_meta);
+
+            dense_ids.insert(snippet_id);
         }
 
         // Sort by fused score descending
@@ -265,38 +1161,41 @@ impl HybridSearchService {
             .into_iter()
             .take(limit)
             .filter_map(|(snippet_id, fused_score)| {
-                // Determine source
-                let dense_count = dense.iter().any(|dr| {
-                    format!("{}#{}", dr.file_path, dr.symbol_name) == snippet_id
-                }) as u32;
-                let sparse_count = sparse.iter().any(|sr| sr.snippet_id == snippet_id) as u32;
-                let source = match (dense_count > 0, sparse_count > 0) {
+                // Determine source from the ids recorded while walking each channel
+                let in_dense = dense_ids.contains(&snippet_id);
+                let in_sparse = sparse_ids.contains(&snippet_id);
+                let source = match (in_dense, in_sparse) {
                     (true, true) => CandidateSource::Fused,
                     (true, false) => CandidateSource::DenseOnly,
                     (false, true) => CandidateSource::SparseOnly,
                     (false, false) => return None,
                 };
 
-                   // Get metadata from dense result
+                // Both channels insert metadata, so every candidate has one here
                 let meta = meta_map.get(&snippet_id)?;
-                
-                // P1: Apply short code penalty
-                let code_len = meta.code_block.trim().chars().count();
-                let final_score = if code_len < self.config.short_code_threshold {
-                    let ratio = code_len as f64 / self.config.short_code_threshold as f64;
-                    let penalty_factor = 1.0 - (1.0 - ratio) * self.config.short_code_penalty;
-                    let penalty_factor = penalty_factor.max(0.0); // clamp to [0, 1]
-                    fused_score * penalty_factor
-                } else {
+
+                // P1: Apply short code penalty — 仅在真的有正文时计算，
+                // 否则纯 BM25 候选（content 未存储）会被当成 0 长度代码而腰斩分数
+                let final_score = if meta.code_block.trim().is_empty() {
                     fused_score
+                } else {
+                    let code_len = meta.code_block.trim().chars().count();
+                    if code_len < config.short_code_threshold {
+                        let ratio = code_len as f64 / config.short_code_threshold as f64;
+                        let penalty_factor = 1.0 - (1.0 - ratio) * config.short_code_penalty;
+                        let penalty_factor = penalty_factor.max(0.0); // clamp to [0, 1]
+                        fused_score * penalty_factor
+                    } else {
+                        fused_score
+                    }
                 };
-                
+
                 Some(FusedCandidate {
                     snippet_id,
                     final_score,
                     file_path: meta.file_path.clone(),
                     symbol_name: meta.symbol_name.clone(),
-                    language: String::new(),
+                    language: meta.language.clone(),
                     line_start: meta.line_start,
                     line_end: meta.line_end,
                     code_block: meta.code_block.clone(),
@@ -311,46 +1210,976 @@ impl HybridSearchService {
         &self.config
     }
 
-    /// 对 RRF 融合结果执行 Cross-Encoder 重排
+    /// 对 RRF 融合结果执行 Cross-Encoder 重排，并保证最终结果满足检索预算阶梯。
+    ///
+    /// # 不变式
+    /// `K_recall >= K_rerank >= K_final`（见 [`SearchBudget`]）：
+    /// - 精排池大小 = `min(K_rerank, fused.len())`，因此池子**至少**有
+    ///   `min(K_final, fused.len())` 条 —— 旧实现用 `limit * candidate_multiplier`
+    ///   且不设下限，`candidate_multiplier = 0` 时池子为 0，精排被静默跳过；
+    /// - 精排排序 key 是 cross-encoder 分数，池外候选用的是 RRF 分数，两套分数不混排：
+    ///   池外候选只可能在「池内可打分候选不足 `K_final`」时被追加。
+    ///
+    /// # 补齐语义
+    /// 补齐来源是**完整原始候选集 `fused`**（而不是仅精排池外的尾部）：精排池只是召回集的
+    /// 前缀，池外尾部同样是合法候选，某个池内候选因缺正文而无法打分时，真正该补上来的
+    /// 可能是池外的靠前条目。补齐按 `snippet_id` 去重，见 [`fill_from_complete_set`]。
+    ///
+    /// # cutoff 语义（与补齐的先后关系）
+    /// 成功分支固定为「先补满、再裁剪」：`truncate(K_final)` → [`fill_from_complete_set`]
+    /// → [`adaptive_cutoff`]（[`ScoreDomain::Rerank`]）。补进来的池外候选没有 cross-encoder
+    /// 分数（`rel = 0`），会被绝对下限自然丢弃 —— 这是「宁缺毋滥」的期望行为，
+    /// 因此这里**不显式过滤**未打分候选，交给统一的 cutoff 裁决。cutoff 还会按 `rel`
+    /// 重排，顺带修复「补齐项 `final_score` 可能大于池内低分」导致的非单调问题。
+    /// 失败分支则用调用方传入的 `rrf_domain`（主路径 [`ScoreDomain::Rrf`]、
+    /// sparse-only 降级 [`ScoreDomain::Bm25Raw`]）施加同一套 cutoff。
+    /// **cutoff 之后不得再补齐**，否则会重新长回被裁掉的低分尾部。
     async fn apply_rerank(
         &self,
         reranker: &RerankerService,
         query: &str,
         fused: Vec<FusedCandidate>,
-        limit: usize,
+        budget: SearchBudget,
+        rrf_domain: ScoreDomain,
     ) -> Result<Vec<FusedCandidate>> {
-        // 取 RRF 候选池（limit * candidate_multiplier），但不超过 fused 总长度
-        let pool_size = (limit * reranker.config().candidate_multiplier).min(fused.len());
-        let (candidate_pool, remaining) = fused.split_at(pool_size);
+        // 池大小 >= min(k_final, fused.len())，且不超过候选总数
+        let pool_size = budget.k_rerank.min(fused.len());
+        let pool: Vec<FusedCandidate> = fused[..pool_size].to_vec();
 
-        debug!("Reranker: sending {} candidates (limit={}, multiplier={})", 
-            pool_size, limit, reranker.config().candidate_multiplier);
+        debug!(
+            "Reranker: sending {} candidates (k_final={}, k_rerank={}, k_recall={}, candidates={}, multiplier={})",
+            pool_size,
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall,
+            fused.len(),
+            reranker.config().candidate_multiplier
+        );
 
-        match reranker.rerank(query, candidate_pool.to_vec()).await {
+        match reranker.rerank(query, pool, budget.k_final).await {
             Ok(mut reranked) => {
-                // 重排结果只取 top limit
-                reranked.truncate(limit);
-                
-                // 如果重排结果不足 limit，用剩余的 RRF 候选填充
-                if reranked.len() < limit {
-                    let need = limit - reranked.len();
-                    reranked.extend(
-                        remaining.iter()
-                            .take(need)
-                            .cloned()
+                // 重排结果只取最终预算
+                reranked.truncate(budget.k_final);
+
+                // 精排不足时从完整原始候选集补齐（池外尾部也是补齐来源）
+                let filled = fill_from_complete_set(&mut reranked, &fused, budget.k_final);
+                if filled > 0 {
+                    debug!(
+                        "Reranker: 从完整原始候选集补齐 {} 条（池 {} / 召回 {} / 目标 {}）",
+                        filled,
+                        pool_size,
+                        fused.len(),
+                        budget.k_final
                     );
                 }
-                
+
+                // 先补满再裁剪：补进来的未打分候选 rel=0，会被绝对下限丢弃 —— 这正是
+                // 「宁缺毋滥」的期望行为，因此不显式过滤它们，交给统一的 cutoff 处理。
+                // cutoff 同时按 rel 重排，修复「补齐项 final_score 可能大于池内低分」造成
+                // 的非单调问题。cutoff 之后**不得**再补齐（否则破坏 cutoff 语义）。
+                adaptive_cutoff(
+                    &mut reranked,
+                    ScoreDomain::Rerank,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
+
                 debug!("Reranker: final {} results after rerank", reranked.len());
                 Ok(reranked)
             }
             Err(e) => {
-                // 降级：返回 RRF 结果
+                // 降级：返回 RRF 结果（分数域由调用方给出：主路径是 Rrf，sparse-only
+                // 降级是 Bm25Raw），同样施加自适应 cutoff
                 warn!("Reranker failed, falling back to RRF results: {}", e);
                 let mut fallback = fused;
-                fallback.truncate(limit);
+                adaptive_cutoff(
+                    &mut fallback,
+                    rrf_domain,
+                    &self.config.cutoff,
+                    budget.k_final,
+                );
                 Ok(fallback)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RerankerConfig;
+
+    /// 60+ chars — 超过 default 的 short_code_threshold(30)，避免惩罚干扰断言
+    const CODE_BLOCK: &str = "fn foo() {\n    let mut v = Vec::new();\n    v.push(1);\n    v\n}\n";
+
+    fn make_dense(
+        file_path: &str,
+        symbol: &str,
+        line_start: usize,
+        line_end: usize,
+    ) -> SearchResult {
+        SearchResult {
+            file_path: file_path.to_string(),
+            symbol_name: symbol.to_string(),
+            code_block: CODE_BLOCK.to_string(),
+            score: 0.9,
+            symbol_type: "function".to_string(),
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+        }
+    }
+
+    fn make_sparse(
+        snippet_id: &str,
+        file_path: &str,
+        symbol: &str,
+        line_start: usize,
+    ) -> TextSearchResult {
+        TextSearchResult {
+            snippet_id: snippet_id.to_string(),
+            score: 3.5,
+            file_path: file_path.to_string(),
+            symbol_name: symbol.to_string(),
+            language: "rust".to_string(),
+            line_start,
+        }
+    }
+
+    #[test]
+    fn sparse_only_candidate_survives_fusion() {
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        let sparse = vec![make_sparse(&id, "/tmp/a.rs", "foo", 0)];
+        let config = HybridSearchConfig::default();
+
+        let fused = HybridSearchService::fuse(Vec::new(), sparse, &config, 10);
+
+        assert_eq!(fused.len(), 1, "纯 BM25 命中不应被丢弃");
+        let c = &fused[0];
+        assert_eq!(c.snippet_id, id);
+        assert_eq!(c.source, CandidateSource::SparseOnly);
+        assert_eq!(c.file_path, "/tmp/a.rs");
+        assert_eq!(c.symbol_name, "foo");
+        assert_eq!(c.language, "rust");
+        assert_eq!(c.line_start, 10, "行号应从 snippet_id 反解得到，不再是 0");
+        assert_eq!(c.line_end, 0);
+        assert!(c.code_block.is_empty());
+        // 没有正文 ⇒ 不施加短代码惩罚，分数就是未惩罚的 1/(k+rank+1)
+        let expected = 1.0 / (config.rrf_k + 0.0 + 1.0);
+        assert!((c.final_score - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sparse_line_start_recovered_from_snippet_id() {
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        let sparse = make_sparse(&id, "/tmp/a.rs", "foo", 0);
+
+        // FusionMeta 侧：行号来自 snippet_id 反解
+        let meta = FusionMeta::from(&sparse);
+        assert_eq!(meta.line_start, 10, "BM25 结果的行号应从 snippet_id 反解");
+
+        // fuse 侧：即使 dense 通道为空也应有真实行号
+        let config = HybridSearchConfig::default();
+        let fused = HybridSearchService::fuse(Vec::new(), vec![sparse], &config, 10);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].line_start, 10);
+        assert_eq!(fused[0].snippet_id, id);
+
+        // provider 已给出非 0 行号时以它为准，不被 id 覆盖
+        let with_line = make_sparse(&id, "/tmp/a.rs", "foo", 3);
+        assert_eq!(sparse_line_start(&with_line), 3);
+    }
+
+    #[test]
+    fn dense_missing_line_start_aligns_with_sparse() {
+        // 模拟旧 LanceDB 表缺 line_start 列：dense 完全没有行号信息
+        let dense = vec![make_dense("/tmp/a.rs", "foo", 0, 0)];
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        // BM25 侧 line_start 字段为 0，但 snippet_id 里带真实行号
+        let sparse = vec![make_sparse(&id, "/tmp/a.rs", "foo", 0)];
+        let config = HybridSearchConfig::default();
+
+        let fused = HybridSearchService::fuse(dense, sparse, &config, 10);
+
+        assert_eq!(
+            fused.len(),
+            1,
+            "回填行号并重算 id 后，两侧必须合并为一条候选"
+        );
+        let c = &fused[0];
+        assert_eq!(c.snippet_id, id);
+        assert_eq!(c.source, CandidateSource::Fused);
+        assert_eq!(c.line_start, 10, "dense 缺失的行号应从 sparse 回填");
+        assert_eq!(c.line_end, 0);
+        let expected = 1.0 / (config.rrf_k + 1.0) + 1.0 / (config.rrf_k + 1.0);
+        assert!(
+            (c.final_score - expected).abs() < 1e-9,
+            "两通道 RRF 分数应累加"
+        );
+        assert!(!c.code_block.is_empty(), "正文应由 dense 通道补齐");
+    }
+
+    #[test]
+    fn fused_ids_align_and_scores_sum() {
+        let dense = vec![make_dense("/tmp/a.rs", "foo", 10, 20)];
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        let sparse = vec![make_sparse(&id, "/tmp/a.rs", "foo", 10)];
+        let config = HybridSearchConfig::default();
+
+        let fused = HybridSearchService::fuse(dense, sparse, &config, 10);
+
+        assert_eq!(fused.len(), 1, "两个通道的 id 必须对齐为同一条候选");
+        let c = &fused[0];
+        assert_eq!(c.snippet_id, id);
+        assert_eq!(c.source, CandidateSource::Fused);
+        let expected = 1.0 / (config.rrf_k + 1.0) + 1.0 / (config.rrf_k + 1.0);
+        assert!((c.final_score - expected).abs() < 1e-9);
+        assert_eq!(c.line_start, 10);
+        assert_eq!(c.line_end, 20);
+        assert_eq!(c.language, "rust");
+        assert!(!c.code_block.is_empty());
+    }
+
+    #[test]
+    fn dense_only_candidate_keeps_real_line_info() {
+        let dense = vec![make_dense("/tmp/a.rs", "foo", 5, 9)];
+        let config = HybridSearchConfig::default();
+
+        let fused = HybridSearchService::fuse(dense, Vec::new(), &config, 10);
+
+        assert_eq!(fused.len(), 1);
+        let c = &fused[0];
+        assert_eq!(c.source, CandidateSource::DenseOnly);
+        assert_eq!(c.snippet_id, CodeChunk::generate_id("/tmp/a.rs", 5, "foo"));
+        assert_eq!(c.line_start, 5);
+        assert_eq!(c.line_end, 9);
+        assert_eq!(c.language, "rust");
+    }
+
+    #[test]
+    fn sparse_only_candidates_degrade_survives_dense_failure() {
+        // dense 通道失败时的降级路径：BM25 命中必须原样成为候选，而不是被整体 Err 丢掉
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        let sparse = make_sparse(&id, "/tmp/a.rs", "foo", 0);
+        let expected_score = sparse.score;
+
+        let candidates = HybridSearchService::sparse_only_candidates(vec![sparse], 10);
+
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        assert_eq!(c.source, CandidateSource::SparseOnly);
+        assert_eq!(c.snippet_id, id);
+        assert_eq!(c.file_path, "/tmp/a.rs");
+        assert_eq!(c.symbol_name, "foo");
+        assert_eq!(c.language, "rust");
+        assert_eq!(c.line_start, 10, "行号应从 snippet_id 反解得到");
+        assert_eq!(c.line_end, 0, "BM25 通道没有结束行");
+        assert!(c.code_block.is_empty(), "BM25 通道不存储正文");
+        assert_eq!(
+            c.final_score, expected_score as f64,
+            "降级不施加 RRF，分数原样保留"
+        );
+    }
+
+    #[test]
+    fn dense_only_candidates_truncates_to_limit() {
+        // sparse 通道失败时的降级路径：保持 dense 顺序并按 limit 截断
+        let dense = vec![
+            make_dense("/tmp/a.rs", "foo", 1, 9),
+            make_dense("/tmp/b.rs", "bar", 11, 19),
+            make_dense("/tmp/c.rs", "baz", 21, 29),
+        ];
+
+        let candidates = HybridSearchService::dense_only_candidates(dense, 2);
+
+        assert_eq!(candidates.len(), 2, "降级路径必须按 limit 截断");
+        assert_eq!(
+            candidates[0].snippet_id,
+            CodeChunk::generate_id("/tmp/a.rs", 1, "foo")
+        );
+        assert_eq!(
+            candidates[1].snippet_id,
+            CodeChunk::generate_id("/tmp/b.rs", 11, "bar")
+        );
+        for c in &candidates {
+            assert_eq!(c.source, CandidateSource::DenseOnly);
+            assert!(!c.code_block.is_empty(), "正文应由 dense 通道自带");
+            assert_eq!(c.final_score, 0.9_f32 as f64, "不做融合，取向量分数");
+        }
+    }
+
+    #[test]
+    fn sparse_only_candidates_preserves_input_rank_order() {
+        // 降级路径不重排：BM25 通道自身已按相关性排序，输出顺序必须一致
+        let high = {
+            let mut s = make_sparse(
+                &CodeChunk::generate_id("/tmp/a.rs", 1, "high"),
+                "/tmp/a.rs",
+                "high",
+                1,
+            );
+            s.score = 8.0;
+            s
+        };
+        let low = {
+            let mut s = make_sparse(
+                &CodeChunk::generate_id("/tmp/b.rs", 5, "low"),
+                "/tmp/b.rs",
+                "low",
+                5,
+            );
+            s.score = 2.0;
+            s
+        };
+
+        let candidates = HybridSearchService::sparse_only_candidates(vec![high, low], 10);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].symbol_name, "high");
+        assert_eq!(candidates[1].symbol_name, "low");
+        assert_eq!(candidates[0].final_score, 8.0);
+        assert_eq!(candidates[1].final_score, 2.0);
+        // provider 已给出非 0 行号时以它为准，不从 id 反解覆盖
+        assert_eq!(candidates[1].line_start, 5);
+    }
+
+    // ---- slice_code_lines ------------------------------------------------
+
+    #[test]
+    fn slice_code_lines_respects_explicit_range() {
+        let content = "line1\nline2\nline3\nline4";
+
+        let (snippet, end) = slice_code_lines(content, 2, 3, 60).expect("1-based 闭区间应可切分");
+
+        assert_eq!(snippet, "line2\nline3");
+        assert_eq!(end, 3, "返回的结束行必须是真实的结束行");
+    }
+
+    #[test]
+    fn slice_code_lines_uses_window_when_line_end_unknown() {
+        let content = "l1\nl2\nl3\nl4\nl5";
+
+        // BM25 通道没有结束行（line_end == 0）：按 fallback 窗口向后取
+        let (snippet, end) = slice_code_lines(content, 2, 0, 3).expect("窗口切分应成功");
+        assert_eq!(snippet, "l2\nl3\nl4");
+        assert_eq!(end, 4, "结束行应是窗口末行，而不是留在 0");
+
+        // 窗口超出文件末尾时必须 clamp，不能 panic
+        let (snippet, end) = slice_code_lines(content, 4, 0, 60).expect("越界窗口应被 clamp");
+        assert_eq!(snippet, "l4\nl5");
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn slice_code_lines_rejects_unusable_line_numbers() {
+        let content = "a\nb";
+
+        assert!(
+            slice_code_lines(content, 3, 0, 60).is_none(),
+            "line_start 越界应返回 None"
+        );
+        assert!(
+            slice_code_lines(content, 0, 2, 60).is_none(),
+            "line_start == 0 表示行号未知"
+        );
+        assert!(
+            slice_code_lines("", 1, 0, 60).is_none(),
+            "空文件没有可切的内容"
+        );
+    }
+
+    #[test]
+    fn slice_code_lines_rejects_blank_snippet() {
+        let content = "code\n   \n\t\nmore";
+
+        assert!(
+            slice_code_lines(content, 2, 3, 60).is_none(),
+            "全空白的片段不应写进证据"
+        );
+    }
+
+    #[test]
+    fn slice_code_lines_keeps_original_indentation() {
+        let content = "fn main() {\n    let x = 1;\n}";
+
+        let (snippet, _) = slice_code_lines(content, 2, 0, 1).expect("单行窗口应可切分");
+
+        assert_eq!(snippet, "    let x = 1;", "缩进属于正文，不能被 trim 掉");
+    }
+
+    // ---- hydrate_code_blocks ---------------------------------------------
+
+    /// 在临时目录里写一个源文件，返回 `(必须保活的 TempDir, 路径字符串)`。
+    fn write_temp_source(file_name: &str, content: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let path = dir.path().join(file_name);
+        std::fs::write(&path, content).expect("写入临时源文件失败");
+        (dir, path.to_string_lossy().into_owned())
+    }
+
+    fn make_candidate(
+        file_path: &str,
+        line_start: usize,
+        line_end: usize,
+        code_block: &str,
+    ) -> FusedCandidate {
+        FusedCandidate {
+            snippet_id: CodeChunk::generate_id(file_path, line_start, "sym"),
+            final_score: 0.5,
+            file_path: file_path.to_string(),
+            symbol_name: "sym".to_string(),
+            language: "rust".to_string(),
+            line_start,
+            line_end,
+            code_block: code_block.to_string(),
+            source: CandidateSource::SparseOnly,
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_fills_missing_body_from_disk() {
+        let source = "fn a() {}\nfn b() {\n    let v = 1;\n    v\n}\n";
+        let (_dir, path) = write_temp_source("a.rs", source);
+
+        let mut candidates = vec![make_candidate(&path, 2, 0, "")];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        let c = &candidates[0];
+        assert!(
+            c.code_block.contains("fn b()"),
+            "正文应从源文件回填，实际：{:?}",
+            c.code_block
+        );
+        assert!(c.code_block.contains("let v = 1;"));
+        assert!(c.line_end > 0, "回填时顺带补上真实结束行，不应还是 0");
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_never_overwrites_existing_body() {
+        let source = "fn a() {}\n";
+        let (_dir, path) = write_temp_source("a.rs", source);
+
+        let original = "dense 通道自带的正文，必须原样保留";
+        let mut candidates = vec![make_candidate(&path, 1, 1, original)];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert_eq!(
+            candidates[0].code_block, original,
+            "已有正文是权威数据，不得覆盖"
+        );
+        assert_eq!(candidates[0].line_end, 1, "已有的结束行也不应被改写");
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_survives_missing_file() {
+        let mut candidates = vec![make_candidate("/nonexistent/codeseek/ghost.rs", 1, 0, "")];
+
+        // 关键断言是「不 panic 也不返回错误」：这里的调用能正常返回即通过
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert!(candidates[0].code_block.is_empty(), "读不到文件时保持原样");
+        assert_eq!(candidates[0].line_end, 0);
+    }
+
+    #[tokio::test]
+    async fn hydrate_code_blocks_slices_multiple_candidates_of_same_file() {
+        let source = "fn one() {}\nfn two() {}\nfn three() {}\n";
+        let (_dir, path) = write_temp_source("b.rs", source);
+
+        // 同一文件的 2 条候选：归组后只读一次盘，但每条都要切到自己的片段
+        let mut candidates = vec![
+            make_candidate(&path, 1, 0, ""),
+            make_candidate(&path, 3, 0, ""),
+        ];
+        HybridSearchService::hydrate_code_blocks(&mut candidates).await;
+
+        assert!(candidates[0].code_block.contains("fn one()"));
+        assert!(candidates[1].code_block.contains("fn three()"));
+        assert!(candidates[0].line_end > 0 && candidates[1].line_end > 0);
+    }
+
+    #[tokio::test]
+    async fn sparse_only_fusion_result_gets_body_after_hydration() {
+        // 端到端复现原 bug：fuse 产出 SparseOnly 空正文 → hydrate → 正文非空
+        let source = "pub fn target() {\n    do_something();\n}\n";
+        let (_dir, path) = write_temp_source("e2e.rs", source);
+
+        let config = HybridSearchConfig::default();
+        let sparse = vec![make_sparse(
+            &CodeChunk::generate_id(&path, 1, "target"),
+            &path,
+            "target",
+            0,
+        )];
+        let mut fused = HybridSearchService::fuse(Vec::new(), sparse, &config, 10);
+
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].source, CandidateSource::SparseOnly);
+        assert!(
+            fused[0].code_block.is_empty(),
+            "BM25 通道构造时候选本就没有正文"
+        );
+
+        HybridSearchService::hydrate_code_blocks(&mut fused).await;
+
+        assert!(
+            !fused[0].code_block.trim().is_empty(),
+            "回填后最终证据不能是空正文"
+        );
+        assert!(fused[0].code_block.contains("do_something()"));
+        assert!(fused[0].line_end > 0);
+    }
+
+    // ---- SearchBudget ----------------------------------------------------
+
+    /// 构造一个「启用精排」的 RerankerService；不发起任何 HTTP 调用。
+    fn enabled_reranker(candidate_multiplier: usize) -> RerankerService {
+        RerankerService::new(RerankerConfig {
+            enabled: true,
+            candidate_multiplier,
+            ..Default::default()
+        })
+    }
+
+    fn candidate_with_id(id: &str) -> FusedCandidate {
+        FusedCandidate {
+            snippet_id: id.to_string(),
+            final_score: 0.5,
+            file_path: format!("/tmp/{}.rs", id),
+            symbol_name: "sym".to_string(),
+            language: "rust".to_string(),
+            line_start: 1,
+            line_end: 2,
+            code_block: "fn f() {}".to_string(),
+            source: CandidateSource::SparseOnly,
+        }
+    }
+
+    fn ids(candidates: &[FusedCandidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.snippet_id.as_str()).collect()
+    }
+
+    #[test]
+    fn search_budget_keeps_recall_rerank_final_ordering() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(5);
+
+        let budget = SearchBudget::new(10, &config, Some(&reranker));
+
+        // 10 (K_final) <= 50 (K_rerank) <= 100 (K_recall)
+        assert_eq!(budget.k_final, 10);
+        assert_eq!(budget.k_rerank, 50, "K_rerank = K_final × multiplier");
+        assert_eq!(
+            budget.k_recall, 100,
+            "K_recall 取 max(dense_limit, sparse_limit, K_rerank)"
+        );
+        assert!(
+            budget.k_final <= budget.k_rerank && budget.k_rerank <= budget.k_recall,
+            "阶梯必须成立：{} <= {} <= {}",
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall
+        );
+    }
+
+    #[test]
+    fn search_budget_clamps_multiplier_zero() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(0);
+
+        let budget = SearchBudget::new(10, &config, Some(&reranker));
+
+        assert_eq!(
+            budget.k_rerank, budget.k_final,
+            "multiplier 配成 0 时按 1 处理，精排池不得被压成 0"
+        );
+        assert!(
+            budget.k_final <= budget.k_rerank && budget.k_rerank <= budget.k_recall,
+            "阶梯必须成立：{} <= {} <= {}",
+            budget.k_final,
+            budget.k_rerank,
+            budget.k_recall
+        );
+    }
+
+    #[test]
+    fn search_budget_without_reranker_collapses_to_final() {
+        let config = HybridSearchConfig::default();
+
+        let budget = SearchBudget::new(10, &config, None);
+
+        assert_eq!(
+            budget.k_rerank, budget.k_final,
+            "未启用精排时 K_rerank 收敛为 K_final"
+        );
+        assert_eq!(
+            budget.k_recall,
+            config
+                .dense_limit
+                .max(config.sparse_limit)
+                .max(budget.k_final),
+            "K_recall 是配置值与 K_final 的最大值"
+        );
+    }
+
+    #[test]
+    fn search_budget_grows_with_large_limit() {
+        let config = HybridSearchConfig::default();
+        let reranker = enabled_reranker(5);
+
+        let budget = SearchBudget::new(500, &config, Some(&reranker));
+
+        assert_eq!(
+            budget.k_rerank, 2500,
+            "大 limit 时精排预算应同步放大，不被 config 的 100 卡住"
+        );
+        assert_eq!(budget.k_recall, 2500, "召回预算必须跟上升级后的精排池");
+        assert!(budget.k_recall >= budget.k_rerank && budget.k_rerank >= budget.k_final);
+    }
+
+    // ---- fill_from_complete_set -----------------------------------------
+
+    #[test]
+    fn fill_from_complete_set_dedupes_and_appends_in_order() {
+        let complete = vec![
+            candidate_with_id("A"),
+            candidate_with_id("B"),
+            candidate_with_id("C"),
+            candidate_with_id("D"),
+        ];
+        let mut ranked = vec![candidate_with_id("A")];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 3);
+
+        assert_eq!(filled, 2, "只补到 k_final 为止");
+        assert_eq!(
+            ids(&ranked),
+            vec!["A", "B", "C"],
+            "按 complete 原顺序补齐且去重"
+        );
+    }
+
+    #[test]
+    fn fill_from_complete_set_noop_when_enough() {
+        let complete = vec![candidate_with_id("A"), candidate_with_id("B")];
+        let mut ranked = vec![candidate_with_id("X"), candidate_with_id("Y")];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 2);
+
+        assert_eq!(filled, 0);
+        assert_eq!(ids(&ranked), vec!["X", "Y"], "已满足预算时顺序不得改变");
+    }
+
+    #[test]
+    fn fill_from_complete_set_backfills_beyond_rerank_pool() {
+        // complete 5 条；ranked 只有前 2 条，其中一条与 complete[2] 重复
+        let complete: Vec<FusedCandidate> = (0..5)
+            .map(|i| candidate_with_id(&format!("c{}", i)))
+            .collect();
+        let mut ranked = vec![complete[0].clone(), complete[2].clone()];
+
+        let filled = fill_from_complete_set(&mut ranked, &complete, 4);
+
+        assert_eq!(filled, 2);
+        assert_eq!(ranked.len(), 4, "必须补齐到 k_final");
+        let mut unique: Vec<&str> = ids(&ranked);
+        let total = unique.len();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), total, "补齐不得产生重复 snippet_id");
+        // 补进来的是 complete 里最靠前、且尚未出现的两条（c1、c3），而不是池外尾部
+        assert_eq!(ids(&ranked), vec!["c0", "c2", "c1", "c3"]);
+        assert!(
+            !ids(&ranked).contains(&"c4"),
+            "补到 k_final 即停，不应越过预算"
+        );
+    }
+
+    // ---- 自适应 cutoff ---------------------------------------------------
+
+    /// 构造指定 `final_score` 的候选，id 自增以便断言「第几条还在」。
+    fn candidate_scored(id: &str, score: f64) -> FusedCandidate {
+        let mut c = candidate_with_id(id);
+        c.final_score = score;
+        c
+    }
+
+    fn candidates_with_scores(scores: &[f64]) -> Vec<FusedCandidate> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| candidate_scored(&format!("c{}", i), *s))
+            .collect()
+    }
+
+    fn scores_of(candidates: &[FusedCandidate]) -> Vec<f64> {
+        candidates.iter().map(|c| c.final_score).collect()
+    }
+
+    #[test]
+    fn cutoff_user_example_drops_low_score() {
+        // 用户给的示例分布：[0.85, 0.81, 0.7, 0.2] → 丢掉 0.2，保留 3 条
+        let mut candidates = candidates_with_scores(&[0.85, 0.81, 0.7, 0.2]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(report.before, 4);
+        assert_eq!(candidates.len(), 3, "0.2 那条必须被绝对下限丢弃");
+        assert_eq!(report.after, 3);
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+        assert!(!scores_of(&candidates).contains(&0.2));
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.85, 0.81, 0.7],
+            "保留区间按 rel 降序，且只做前缀截断"
+        );
+    }
+
+    #[test]
+    fn cutoff_smooth_distribution_not_cut() {
+        // 平滑分布：相邻跌幅只有 ~0.012，断层检测必须不触发
+        let mut candidates = candidates_with_scores(&[0.85, 0.84, 0.83, 0.82]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 4, "平滑分布不得被裁剪");
+        assert_eq!(report.trigger, CutoffTrigger::None);
+        assert_eq!(report.len_gap, 4, "len_gap 应等于 len_ratio（未发现断层）");
+    }
+
+    #[test]
+    fn cutoff_dominant_top_cuts_tail() {
+        // top1 远高于其后 ⇒ 相对比例闸门（0.9 × 0.55 = 0.495）只放行 1 条
+        let mut candidates = candidates_with_scores(&[0.9, 0.3, 0.29, 0.28]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 1, "只应保留头部 1 条");
+        assert_eq!(candidates[0].final_score, 0.9);
+        assert_eq!(report.len_ratio, 1);
+        assert_eq!(report.trigger, CutoffTrigger::RelativeRatio);
+    }
+
+    #[test]
+    fn cutoff_absolute_floor_is_hard() {
+        // 全部低于绝对下限 ⇒ 硬闸直接清空（不受 min_keep 影响）
+        let mut candidates = candidates_with_scores(&[0.15, 0.12]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert!(candidates.is_empty(), "全部 rel <= abs_floor 时必须清空");
+        assert_eq!(report.after, 0);
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+    }
+
+    #[test]
+    fn cutoff_absolute_floor_is_exclusive() {
+        // 严格大于才通过：rel == abs_floor(0.2) 必须被丢弃
+        let mut candidates = candidates_with_scores(&[0.5, 0.2]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].final_score, 0.5);
+        assert!(
+            !scores_of(&candidates).contains(&0.2),
+            "rel == abs_floor 必须被丢弃（判定用严格大于）"
+        );
+    }
+
+    #[test]
+    fn cutoff_rrf_domain_never_empties_results() {
+        // 双通道 RRF：top1 = 2/(k+1)，其余单通道 = 1/(k+1)
+        let rrf_k = 60.0;
+        let max_possible = 2.0 / (rrf_k + 1.0);
+        let mut candidates = candidates_with_scores(&[
+            2.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+        ]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(
+            &mut candidates,
+            ScoreDomain::Rrf { max_possible },
+            &cfg,
+            10,
+        );
+
+        assert!(!candidates.is_empty(), "RRF 域绝不能被绝对下限清空");
+        assert_eq!(report.len_ratio, 3, "rel_ratio_rrf=0.40 生效，单通道 rel=0.5 全部通过");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "若误用连续域的 rel_ratio=0.55，单通道 rel=0.5 会被砍到只剩 1 条"
+        );
+        assert_eq!(report.trigger, CutoffTrigger::None);
+    }
+
+    #[test]
+    fn cutoff_rrf_domain_skips_gap_detection() {
+        // 双通道 top1(rel=1.0) + 3 条单通道(rel=0.5)：相对跌幅恒为 0.5
+        let rrf_k = 60.0;
+        let max_possible = 2.0 / (rrf_k + 1.0);
+        let mut candidates = candidates_with_scores(&[
+            2.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+            1.0 / (rrf_k + 1.0),
+        ]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(
+            &mut candidates,
+            ScoreDomain::Rrf { max_possible },
+            &cfg,
+            10,
+        );
+
+        assert_eq!(
+            report.len_gap, report.len_ratio,
+            "RRF 域必须跳过断层检测：len_gap 恒等于 len_ratio"
+        );
+        assert!(
+            candidates.len() > 1,
+            "档位跌幅 0.5 不得把结果砍到 1 条，实际 {}",
+            candidates.len()
+        );
+        assert_eq!(candidates.len(), 4);
+
+        // 对照：同一套阈值在连续域会真的触发断层（[0.9,0.6,0.55,0.3] 首对跌幅 0.333）
+        let mut continuous = candidates_with_scores(&[0.9, 0.6, 0.55, 0.3]);
+        let report_c = adaptive_cutoff(&mut continuous, ScoreDomain::Rerank, &cfg, 10);
+        assert_eq!(report_c.trigger, CutoffTrigger::ScoreGap);
+        assert_eq!(continuous.len(), 1, "连续域断层检测应真正生效");
+    }
+
+    #[test]
+    fn cutoff_disabled_is_pure_truncate() {
+        let mut candidates = candidates_with_scores(&[0.9, 0.88, 0.86, 0.84, 0.82]);
+        let cfg = AdaptiveCutoffConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 3);
+
+        assert_eq!(candidates.len(), 3, "关闭时仅按 k_final 截断");
+        assert_eq!(report.trigger, CutoffTrigger::Disabled);
+        assert_eq!(report.after, 3);
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.9, 0.88, 0.86],
+            "关闭时不重排、不裁剪，退化为旧行为"
+        );
+    }
+
+    #[test]
+    fn cutoff_handles_nan_scores() {
+        // NaN 分数不得 panic；rel=0 ⇒ 排到末尾并被绝对下限丢弃
+        let mut candidates = candidates_with_scores(&[0.9, f64::NAN, 0.85]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(candidates.len(), 2, "NaN 项应被丢弃");
+        assert!(candidates.iter().all(|c| c.final_score.is_finite()));
+        assert_eq!(scores_of(&candidates), vec![0.9, 0.85]);
+        assert_eq!(report.before, 3);
+        assert_eq!(report.after, 2);
+    }
+
+    #[test]
+    fn cutoff_single_candidate_and_empty() {
+        let cfg = AdaptiveCutoffConfig::default();
+
+        // 空输入
+        let mut empty: Vec<FusedCandidate> = Vec::new();
+        let report = adaptive_cutoff(&mut empty, ScoreDomain::Rerank, &cfg, 10);
+        assert!(empty.is_empty());
+        assert_eq!(report, CutoffReport::default(), "空输入返回全 0 报告");
+
+        // 单条且高于下限
+        let mut single = candidates_with_scores(&[0.9]);
+        let report = adaptive_cutoff(&mut single, ScoreDomain::Rerank, &cfg, 10);
+        assert_eq!(single.len(), 1);
+        assert_eq!(report.len_abs, 1);
+        assert_eq!(report.trigger, CutoffTrigger::None);
+
+        // 单条且低于下限
+        let mut weak = candidates_with_scores(&[0.1]);
+        let report = adaptive_cutoff(&mut weak, ScoreDomain::Rerank, &cfg, 10);
+        assert!(weak.is_empty());
+        assert_eq!(report.trigger, CutoffTrigger::AbsoluteFloor);
+    }
+
+    #[test]
+    fn cutoff_resorts_non_monotonic_input() {
+        // 复现 apply_rerank 成功分支的非单调：fill_from_complete_set 把未打分的 RRF
+        // 候选（0.0328）追加到 rerank 低分（0.2）之后，输入并非降序
+        let mut candidates = candidates_with_scores(&[0.0328, 0.88, 0.2, 0.85]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 10);
+
+        assert_eq!(
+            scores_of(&candidates),
+            vec![0.88, 0.85],
+            "必须按 rel 重排后再截断：高分项不得被误杀，输出严格降序"
+        );
+        assert_eq!(report.before, 4);
+        assert_eq!(report.after, 2);
+    }
+
+    #[test]
+    fn cutoff_respects_k_final() {
+        let mut candidates = candidates_with_scores(&[0.9; 10]);
+        let cfg = AdaptiveCutoffConfig::default();
+
+        let report = adaptive_cutoff(&mut candidates, ScoreDomain::Rerank, &cfg, 3);
+
+        assert_eq!(candidates.len(), 3, "不得突破 k_final");
+        assert_eq!(report.len_abs, 3, "有效长度被 k_final 收窄");
+        assert_eq!(report.trigger, CutoffTrigger::None);
+    }
+
+    #[test]
+    fn to_relevance_maps_each_domain() {
+        // RRF：双通道 top1 → 1.0，单通道 top1 → 0.5
+        let rrf_k = 60.0;
+        let dual = ScoreDomain::Rrf {
+            max_possible: 2.0 / (rrf_k + 1.0),
+        };
+        assert_eq!(dual.to_relevance(2.0 / (rrf_k + 1.0)), 1.0);
+        assert!(
+            (dual.to_relevance(1.0 / (rrf_k + 1.0)) - 0.5).abs() < 1e-12,
+            "单通道 top1 归一化为 0.5"
+        );
+        assert_eq!(dual.to_relevance(1.0), 1.0, "超出上界的分数被 clamp");
+
+        // dense 相似度：本身就在 [0,1]，越界 clamp
+        assert!((ScoreDomain::DenseSim.to_relevance(0.7) - 0.7).abs() < 1e-12);
+        assert_eq!(ScoreDomain::DenseSim.to_relevance(1.7), 1.0);
+        assert_eq!(ScoreDomain::DenseSim.to_relevance(-0.5), 0.0);
+
+        // BM25 原始分：以本批 top 为分母
+        let bm25 = ScoreDomain::Bm25Raw { top: 10.0 };
+        assert!((bm25.to_relevance(5.0) - 0.5).abs() < 1e-12);
+        assert_eq!(bm25.to_relevance(20.0), 1.0, "超过 top 时 clamp 到 1.0");
+        assert_eq!(
+            ScoreDomain::Bm25Raw { top: 0.0 }.to_relevance(5.0),
+            0.0,
+            "分母为 0 时一律 0.0，不产生 inf/NaN"
+        );
+
+        // reranker 概率：直接 clamp；非有限输入 → 0.0
+        assert!((ScoreDomain::Rerank.to_relevance(0.42) - 0.42).abs() < 1e-12);
+        assert_eq!(ScoreDomain::Rerank.to_relevance(f64::NAN), 0.0);
+        assert_eq!(ScoreDomain::Rerank.to_relevance(f64::INFINITY), 0.0);
     }
 }

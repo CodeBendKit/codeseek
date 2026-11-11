@@ -7,3 +7,4 @@ pub mod ui;
 pub mod mcp;
 pub mod watcher;
 pub mod detector;
+pub mod knowledge;

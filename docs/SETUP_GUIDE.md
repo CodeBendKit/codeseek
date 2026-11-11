@@ -88,13 +88,24 @@ Create or edit `~/.codeseek/config.json`:
     "model": "Qwen/Qwen3-Embedding-4B",
     "api_token": "sk-your-token-here",
     "api_base_url": "https://api.siliconflow.cn/v1",
-    "dimensions": 2560
+    "dimensions": 2560,
+    "instruct": "Given a code search query, retrieve relevant functions or code snippets that answer the query."
   },
   "index": {
     "min_code_block_length": 16
   }
 }
 ```
+
+`instruct` is the Qwen3-Embedding query-side instruction (asymmetric retrieval): it is prepended
+to the **query only** (`Instruct: {instruct}\nQuery:{query}`); indexed code stays raw text.
+Omit the field to use the built-in default above; set it to `""` to disable the prefix entirely.
+
+`min_code_block_length` applies to the **dense (vector) channel only**: it is a minimum block length
+in characters (measured after `trim()`), because shorter blocks carry too little semantic signal and
+lower embedding retrieval quality. The **BM25 sparse channel performs no length filtering** — short
+blocks are often exactly what identifier / keyword queries look for — and their relevance is instead
+down-weighted by the fusion layer's `short_code_penalty`.
 
 Then run `codeseek init` to build the index with embeddings.
 

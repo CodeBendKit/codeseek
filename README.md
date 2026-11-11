@@ -251,7 +251,8 @@ No daemon, no HTTP server. Every command is a standalone process.
     "model": "Qwen/Qwen3-Embedding-4B",
     "api_token": "sk-...",
     "api_base_url": "https://api.siliconflow.cn/v1",
-    "dimensions": 2560
+    "dimensions": 2560,
+    "instruct": "Given a code search query, retrieve relevant functions or code snippets that answer the query."
   },
   "index": {
     "min_code_block_length": 16,
@@ -276,6 +277,11 @@ No daemon, no HTTP server. Every command is a standalone process.
   "installed_hooks": {}
 }
 ```
+
+> `embedding.instruct` — Qwen3-Embedding query-side instruction (asymmetric retrieval). Only the
+> search query gets the official `Instruct: {instruct}\nQuery:{query}` prefix; indexed code stays
+> raw, so existing vector indexes remain valid. Omit it to use the default shown above; set it to
+> `""` to turn the prefix off.
 
 ### Model Roles
 

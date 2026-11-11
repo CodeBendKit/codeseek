@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::codegraph::types::PetCodeGraph;
+use crate::codegraph::types::{CallRelation, PetCodeGraph};
 
 // ─── Core Query Functions ───────────────────────────────────────
 
@@ -34,7 +34,7 @@ pub fn execute_callgraph(
         visited.insert(center.id);
         let callees = collect_callees_json(graph, &center.id, depth, &mut visited);
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "function_name": symbol,
             "depth": depth,
             "center": {
@@ -49,6 +49,18 @@ pub fn execute_callgraph(
             "callers": callers,
             "callees": callees,
         });
+
+        // ---- Phase P2b 交付物 3：只追加字段，既有字段名/结构一律不变（红线 4）----
+        if let Some(qualified) = center.qualified_name.as_ref() {
+            result["center"]["qualified_name"] = serde_json::Value::String(qualified.clone());
+        }
+        if let Some(module_path) = center.module_path.as_ref() {
+            result["center"]["module_path"] = serde_json::Value::String(module_path.clone());
+        }
+        append_resolution_fields(
+            &mut result["center"],
+            best_incoming_resolution(graph, &center.id),
+        );
 
         Ok(serde_json::to_string_pretty(&result)?)
     } else {
@@ -75,6 +87,58 @@ pub fn execute_callgraph(
         }
 
         Ok(output)
+    }
+}
+
+/// Phase P2b 交付物 3：把一条调用边上的"解析元信息"**追加**成 JSON 字段。
+///
+/// 只追加、**绝不改动**任何既有字段名/结构（红线 4）：
+/// - `resolution_level`：命中该边所依据的解析层级（0 = 未解析/legacy）；
+/// - `confidence`：该层级的置信度；
+/// - `candidate_count`：该调用点截断前的真实候选总数；
+/// - `ambiguous`：`candidate_count >= 2`（layered 的歧义调用点，每个候选一条边）；
+/// - `resolution_rank`：该候选在同层候选里的排序位（0 = 最优）。
+///
+/// legacy 模式下这四项恒为 `0/0/0/false/0`（新字段 `#[serde(default)]`，老缓存读出来也是 0），
+/// 所以消费方在升级前后看到的既有字段完全一致。
+fn resolution_fields_of_relation(relation: &CallRelation) -> serde_json::Value {
+    serde_json::json!({
+        "resolution_level": relation.resolution_level,
+        "confidence": relation.confidence,
+        "candidate_count": relation.candidate_count,
+        "ambiguous": relation.candidate_count >= 2,
+        "resolution_rank": relation.rank,
+    })
+}
+
+/// Phase P2b：中心节点没有"唯一一条边"，因此取**解释力最强**的那条来代表它的身份：
+/// 入边里 `confidence` 最大者，同分取 `rank` 小者，再同取 callee_id 小者（跨进程确定）。
+/// 中心没有任何入边时（例如查询根函数）返回 `None` ⇒ 一个字段都不追加，
+/// **绝不凭空造一个"0 层级"的假身份**。
+fn best_incoming_resolution(
+    graph: &PetCodeGraph,
+    function_id: &Uuid,
+) -> Option<serde_json::Value> {
+    let relations: Vec<&CallRelation> =
+        graph.get_callers(function_id).into_iter().map(|(_, rel)| rel).collect();
+    let best = relations
+        .into_iter()
+        .min_by(|a, b| {
+            b.confidence
+                .cmp(&a.confidence)
+                .then_with(|| a.rank.cmp(&b.rank))
+                .then_with(|| a.callee_id.as_u128().cmp(&b.callee_id.as_u128()))
+        })?;
+    Some(resolution_fields_of_relation(best))
+}
+
+/// Phase P2b：把追加字段并进一个已构造好的节点对象（保持既有键顺序不变，只在尾部追加）。
+fn append_resolution_fields(node: &mut serde_json::Value, fields: Option<serde_json::Value>) {
+    let Some(fields) = fields else { return };
+    if let (Some(obj), Some(map)) = (node.as_object_mut(), fields.as_object()) {
+        for (key, value) in map {
+            obj.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -105,6 +169,11 @@ pub fn collect_callers_json(
             "signature": caller.signature,
             "call_line": relation.line_number,
         });
+        // ---- Phase P2b 交付物 3：追加解析元信息（既有键与顺序不变）----
+        append_resolution_fields(&mut node, Some(resolution_fields_of_relation(relation)));
+        if let Some(qualified) = caller.qualified_name.as_ref() {
+            node["qualified_name"] = serde_json::Value::String(qualified.clone());
+        }
 
         if depth > 1 {
             let sub_callers = collect_callers_json(graph, &caller.id, depth - 1, visited);
@@ -146,6 +215,11 @@ pub fn collect_callees_json(
             "signature": callee.signature,
             "call_line": relation.line_number,
         });
+        // ---- Phase P2b 交付物 3：追加解析元信息（既有键与顺序不变）----
+        append_resolution_fields(&mut node, Some(resolution_fields_of_relation(relation)));
+        if let Some(qualified) = callee.qualified_name.as_ref() {
+            node["qualified_name"] = serde_json::Value::String(qualified.clone());
+        }
 
         if depth > 1 {
             let sub_callees = collect_callees_json(graph, &callee.id, depth - 1, visited);
@@ -254,6 +328,8 @@ mod tests {
                 namespace: String::new(),
                 language: "rust".to_string(),
                 signature: Some(format!("fn {}()", name)),
+                module_path: None,
+                qualified_name: None,
             });
             (self, id)
         }
@@ -286,6 +362,10 @@ mod tests {
                     callee_file,
                     line_number: 5,
                     is_resolved: true,
+                    resolution_level: 0,
+                    confidence: 0,
+                    rank: 0,
+                    candidate_count: 0,
                 };
                 let _ = graph.add_call_relation(relation);
             }

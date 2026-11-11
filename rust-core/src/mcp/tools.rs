@@ -137,5 +137,122 @@ pub fn all_tools() -> Vec<Tool> {
                 "required": ["function_name"]
             }),
         },
+        Tool {
+            name: "knowledge_add".into(),
+            description: "Add a knowledge record to the persistent knowledge base. Use to store learned insights, patterns, or solutions for future semantic retrieval.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["repo_retrieval", "coding_modification"],
+                        "description": "Knowledge type"
+                    },
+                    "title": {
+                        "type": "string",
+                        "maxLength": 30,
+                        "description": "Title (≤30 chars)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "maxLength": 500,
+                        "description": "Knowledge content (≤500 chars)"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Search tags"
+                    },
+                    "related_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Related file paths"
+                    },
+                    "source_agent": {
+                        "type": "string",
+                        "enum": ["repo_agent", "coding_agent"],
+                        "description": "Source agent"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Associated task ID"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.8,
+                        "description": "Confidence 0-1"
+                    }
+                },
+                "required": ["type", "title", "content"]
+            }),
+        },
+        Tool {
+            name: "knowledge_search".into(),
+            description: "Semantically search the knowledge base for relevant historical knowledge (hybrid vector + BM25).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 8,
+                        "description": "Max results"
+                    },
+                    "rerank": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Enable reranking (currently a no-op)"
+                    },
+                    "domains": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Domain filter: repo and/or coding. Empty = all domains."
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        Tool {
+            name: "knowledge_list".into(),
+            description: "List knowledge records with optional type/tag filtering.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "default": 50,
+                        "description": "Max results"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["repo_retrieval", "coding_modification"],
+                        "description": "Filter by type"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Filter by tag (match any)"
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "knowledge_delete".into(),
+            description: "Delete a knowledge record by its ID.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Knowledge record ID (kn_*)"
+                    }
+                },
+                "required": ["id"]
+            }),
+        },
     ]
 }

@@ -36,6 +36,16 @@ impl Error for ParserError {}
 
 pub trait AstLanguageParser: Send {
     fn parse(&mut self, code: &str, path: &PathBuf) -> Vec<AstSymbolInstanceArc>;
+
+    /// Phase P1 交付物 2(b)：源文件显式声明的模块/包路径分段（Java 的 `package a.b.c;`）。
+    ///
+    /// 默认 `None` —— 其余 6 个语言 parser 没有"文件级包声明"这一概念（Rust 的 module path
+    /// 由文件路径推导，Python/TS 同理），因此无需改动它们的实现。
+    /// 由 `TreeSitterParser::parse_file_with_metadata` 透出给上层，供 `resolution::ScopeBuilder`
+    /// / `ResolutionIndex::file_module` 推导 module path。
+    fn parsed_package(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 fn internal_error<E: Display>(err: E) -> ParserError {

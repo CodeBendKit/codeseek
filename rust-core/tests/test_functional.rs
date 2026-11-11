@@ -149,7 +149,9 @@ fn test_query_call_graph_for_project(storage: &Arc<StorageManager>, project_path
     let project_id = format!("{:x}", md5::compute(project_path.as_bytes()));
     
     // 保存图
-    let save_result = storage.get_persistence().save_graph(&project_id, &pet_graph);
+    let save_result = // Phase P3 收口：`save_graph` 现在强制要求解析档位戳（`resolver_mode` + `max_candidates`）。
+    // 这里存的是 `CodeAnalyzer` 默认档位（layered）产出的图，戳必须与之一致。
+    storage.get_persistence().save_graph(&project_id, &pet_graph, "layered", 8);
     assert!(save_result.is_ok(), "Failed to save graph: {:?}", save_result.err());
     
     // 测试查询特定函数
@@ -341,7 +343,9 @@ fn test_complete_build_and_query_workflow() {
     
     // 步骤3: 保存图
     let project_id = format!("{:x}", md5::compute(project_path.as_bytes()));
-    let save_result = storage.get_persistence().save_graph(&project_id, &pet_graph);
+    let save_result = // Phase P3 收口：`save_graph` 现在强制要求解析档位戳（`resolver_mode` + `max_candidates`）。
+    // 这里存的是 `CodeAnalyzer` 默认档位（layered）产出的图，戳必须与之一致。
+    storage.get_persistence().save_graph(&project_id, &pet_graph, "layered", 8);
     assert!(save_result.is_ok(), "Failed to save graph");
     
     // 步骤4: 加载图

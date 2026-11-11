@@ -113,7 +113,8 @@
       },
       "path_components": [
         "java",
-        "util"
+        "util",
+        "*"
       ],
       "alias": null,
       "import_type": "System",

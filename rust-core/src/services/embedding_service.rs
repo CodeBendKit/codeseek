@@ -10,7 +10,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatchIterator;
 use uuid::Uuid;
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use anyhow::anyhow;
 
 use crate::codegraph::treesitter::TreeSitterParser;
 use crate::codegraph::parser::CodeParser;
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_QUERY_INSTRUCT};
 use crate::storage::traits_bm25::{TextSearchProvider, CodeChunk};
 
 use lancedb::table::OptimizeAction;
@@ -30,6 +30,70 @@ use chrono::TimeDelta;
 
 /// 累积软删除次数阈值，达到后自动触发 LanceDB compaction
 const OPTIMIZE_DELETE_THRESHOLD: u64 = 10;
+
+/// embedding API 输入的上限，单位为**字节**（不是字符数，也不是 token 数）。
+/// 约对应 32k token 的保守取值：混合内容（中英/代码/emoji）下按 ~2 字节/token 估算。
+const MAX_EMBEDDING_INPUT_BYTES: usize = 64_000;
+
+/// 按字节上限截断字符串，若截断点落在多字节字符中间则回退到最近的 UTF-8 char boundary，
+/// 保证不 panic 且返回值为原串的合法前缀。
+///
+/// 说明：`max_bytes` 是**字节**上限。`s.len() <= max_bytes` 时原样返回；
+/// `max_bytes == 0`（或回退后为 0，如首个多字节字符就超出上限）时返回空串。
+fn truncate_to_byte_limit(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// 判断代码块是否应进入 dense（向量）通道。
+///
+/// `min_code_block_length` 是 **dense 专用**阈值，按 `trim()` 后的字符数
+/// （`chars().count()`，**不是字节数**）比较：过短的代码块语义信息不足，
+/// embedding 信噪比低，会拉低向量检索的整体质量。
+///
+/// 注意：该阈值**不得**用于 BM25 稀疏通道（见 [`should_index_bm25`]）——
+/// 短代码块在词项检索里往往是高价值召回，不应因 dense 的质量门槛被裁掉。
+fn should_index_dense(code_block: &str, min_code_block_length: usize) -> bool {
+    code_block.trim().chars().count() >= min_code_block_length
+}
+
+/// 判断代码块是否应进入 BM25（稀疏）通道。
+///
+/// BM25 **不做任何长度过滤**：短代码块往往正是标识符 / 关键字查询
+/// （`fn`、`id`、`useState` …）的目标，相关性交给融合层的 `short_code_penalty`
+/// （见 `services/hybrid_search.rs`）统一降权，而不是在入库前裁掉。
+///
+/// 这里只排除 `trim()` 后为空的块 —— 空文本产生 0 个 token，写入索引没有意义。
+fn should_index_bm25(code_block: &str) -> bool {
+    !code_block.trim().is_empty()
+}
+
+/// 按 Qwen3-Embedding 官方模板为**查询**拼接指令前缀：
+///
+/// ```text
+/// Instruct: {task_description}\nQuery:{query}
+/// ```
+///
+/// 格式细节（逐字符固定，官方 README `get_detailed_instruct`）：
+/// `Instruct:` 冒号后**有一个空格**；中间是 `\n`；`Query:` 冒号后**没有空格**，紧接查询原文。
+///
+/// ⚠️ 该函数**只允许出现在查询路径**。文档/代码入库路径（`process_file_content`、
+/// `KnowledgeStore::add`）必须继续发送裸文本，否则已建好的 LanceDB 向量索引全部失效。
+///
+/// - `instruct` 为空（配置显式关闭）→ 原样返回 query，不加任何前缀
+/// - `query` 为空白 → 原样返回，保持"空输入报错"的既有行为，不会把指令单独 embedding
+pub fn build_instruct_query(instruct: &str, query: &str) -> String {
+    if instruct.is_empty() || query.trim().is_empty() {
+        return query.to_string();
+    }
+    format!("Instruct: {}\nQuery:{}", instruct, query)
+}
 
 struct EmbeddingCache {
     conn: Mutex<SqliteConnection>,
@@ -113,6 +177,9 @@ pub struct SearchResult {
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Get embedding for a single text (used for search queries).
+    ///
+    /// ⚠️ 输入**原样**发给 API：不在此处、也不在 `get_embeddings_batch` 内加任何指令前缀。
+    /// 查询侧前缀只由 [`EmbeddingProvider::format_query`] 在调用点构造。
     async fn get_embedding(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>>;
     /// Batch embed multiple texts in one API call. Default falls back to sequential single calls.
     async fn get_embeddings_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
@@ -122,6 +189,13 @@ pub trait EmbeddingProvider: Send + Sync {
         }
         Ok(results)
     }
+    /// **查询专用**：按 Qwen3-Embedding 官方模板给查询加指令前缀（非对称检索）。
+    ///
+    /// 默认实现是恒等变换 —— 不支持 instruction-aware 的模型 / 测试用 mock provider
+    /// 保持裸文本。文档、代码、知识记录的入库路径**禁止**调用本方法。
+    fn format_query(&self, query: &str) -> String {
+        query.to_string()
+    }
     fn model(&self) -> String;
 }
 
@@ -130,6 +204,9 @@ pub struct OpenAICompatibleEmbeddingProvider {
     api_token: String,
     base_url: String,
     model: String,
+    /// 查询侧指令（来自 `EmbeddingConfig::effective_instruct`）。空串 = 关闭注入。
+    /// 只被 `format_query` 读取，`get_embedding` / `get_embeddings_batch` 完全不受影响。
+    instruct: String,
 }
 
 impl OpenAICompatibleEmbeddingProvider {
@@ -142,7 +219,16 @@ impl OpenAICompatibleEmbeddingProvider {
             api_token,
             base_url,
             model,
+            // 缺省即官方推荐的 instruction-aware 用法；用 with_instruct("") 关闭
+            instruct: DEFAULT_QUERY_INSTRUCT.to_string(),
         }
+    }
+
+    /// 设置查询侧 instruct。传入空串表示关闭前缀注入。
+    /// 注意：该设置**只影响 `format_query`**，入库文本永远保持裸文本。
+    pub fn with_instruct(mut self, instruct: impl Into<String>) -> Self {
+        self.instruct = instruct.into();
+        self
     }
 }
 
@@ -152,20 +238,20 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
         self.model.clone()
     }
 
+    /// 查询侧加官方指令前缀；`instruct` 为空时保持裸文本（等效于关闭）。
+    fn format_query(&self, query: &str) -> String {
+        build_instruct_query(&self.instruct, query)
+    }
+
     async fn get_embedding(&self, code_block: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         if code_block.is_empty() {
             return Err("Code block is empty".into());
         }
 
-        // Truncate if too long (approx 32k tokens, safe limit 30k chars for now)
-        // Note: 32K context window is quite large, but we should still have a safety limit
-        // Assuming ~4 chars per token for English, 32k tokens is ~128k chars.
-        // For mixed content, being conservative with 64k chars is safe.
-        let code_block = if code_block.len() > 64000 {
-            &code_block[..64000]
-        } else {
-            code_block
-        };
+        // Truncate if too long — 32K 上下文窗口很大，但仍需保守的安全上限。
+        // MAX_EMBEDDING_INPUT_BYTES 是**字节**上限（不是字符数，约对应 32k token）；
+        // 截断点会对齐到 UTF-8 char boundary，避免在多字节字符（中文/emoji）中间切片导致 panic。
+        let code_block = truncate_to_byte_limit(code_block, MAX_EMBEDDING_INPUT_BYTES);
         
         let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
         let response = self.client.post(&url)
@@ -200,8 +286,9 @@ impl EmbeddingProvider for OpenAICompatibleEmbeddingProvider {
             return Ok(Vec::new());
         }
 
+        // 每条输入按字节上限截断，截断点对齐到 UTF-8 char boundary（见 truncate_to_byte_limit）
         let texts: Vec<&str> = texts.iter()
-            .map(|t| if t.len() > 64000 { &t[..64000] } else { t.as_str() })
+            .map(|t| truncate_to_byte_limit(t, MAX_EMBEDDING_INPUT_BYTES))
             .collect();
 
         let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
@@ -271,6 +358,8 @@ impl EmbeddingService {
         let mut base_url = None;
         let mut model = "Qwen/Qwen3-Embedding-4B".to_string(); // Default fallback
         let mut dimensions = 2560;
+        // 查询侧指令：无配置时用默认指令；配置里显式空串时关闭注入
+        let mut instruct = DEFAULT_QUERY_INSTRUCT.to_string();
 
         if let Some(conf) = config {
              let embedding_config = &conf.embedding;
@@ -283,12 +372,14 @@ impl EmbeddingService {
              if !embedding_config.model.is_empty() {
                  model = embedding_config.model.clone();
              }
+             instruct = embedding_config.effective_instruct().to_string();
              dimensions = embedding_config.dimensions as i32;
         }
         
         let api_token = api_token.ok_or("API Key not found in config or environment")?;
         
-        let provider = OpenAICompatibleEmbeddingProvider::new(api_token, base_url, model);
+        let provider = OpenAICompatibleEmbeddingProvider::new(api_token, base_url, model)
+            .with_instruct(instruct);
         
         let min_code_block_length = config
             .map(|cfg| cfg.index.min_code_block_length)
@@ -562,16 +653,16 @@ impl EmbeddingService {
             };
 
             if let Some((code_block, name, symbol_type_str, language_str, start_row, end_row)) = extracted {
-                // P0: Skip short code blocks to improve retrieval quality
-                // See: docs/retrieval-quality-analysis.md
-                if code_block.trim().chars().count() < self.min_code_block_length {
-                    debug!("Skipping short symbol '{}' ({} chars, min: {})", 
-                        name, code_block.len(), self.min_code_block_length);
-                    continue;
-                }
-                
-                // Index into BM25 if available
-                if self.bm25_index.is_some() {
+                // ── 通道分层：先判 BM25（稀疏），再判 dense（向量）──
+                //
+                // 两个通道的质量判据不同，必须分开处理，不能用同一把尺子：
+                //   * BM25 是词项匹配，短代码块（`fn f()`、`x`）往往正是标识符 / 关键字查询的
+                //     目标，因此**不做长度过滤**，只排除 trim 后为空的块（空文本产生 0 个 token，
+                //     写入索引无意义）。相关性由融合层的 short_code_penalty 统一降权。
+                //   * dense 阈值（min_code_block_length）用于避免语义信息不足的块拉低向量检索
+                //     信噪比，**只作用于向量通道**，绝不能反过来把 BM25 候选一起裁掉。
+                // 规则来源：混合检索分层设计（dense 控语义质量 / BM25 控词项召回 / 融合层控排序）。
+                if self.bm25_index.is_some() && should_index_bm25(&code_block) {
                     let chunk = CodeChunk::new(
                         file_path.to_string_lossy().into_owned(),
                         code_block.clone(),
@@ -582,6 +673,25 @@ impl EmbeddingService {
                         end_row + 1,
                     );
                     bm25_chunks.push(chunk);
+                }
+
+                // dense 通道长度过滤：判据与日志口径统一为**字符数**（trim 后 chars().count()），
+                // 避免中文代码块下「字节数 vs 字符数」口径不一致导致排障误判。
+                if !should_index_dense(&code_block, self.min_code_block_length) {
+                    let code_chars = code_block.trim().chars().count();
+                    debug!(
+                        "Skipping short symbol '{}' from dense channel ({} chars, min: {})",
+                        name, code_chars, self.min_code_block_length
+                    );
+                    // 仅当该块确实已进 BM25（有稀疏索引且非空块）时提示，避免空块场景误报
+                    if self.bm25_index.is_some() && should_index_bm25(&code_block) {
+                        // 已进 BM25、仅被 dense 过滤：便于排障时区分「未召回」与「只走稀疏通道」
+                        debug!(
+                            "Symbol '{}' kept in BM25 sparse channel only ({} chars < dense min {})",
+                            name, code_chars, self.min_code_block_length
+                        );
+                    }
+                    continue;
                 }
 
                 // Check cache first; collect cache-miss items for batch processing
@@ -632,6 +742,7 @@ impl EmbeddingService {
             info!("Batch-embedding {} cache misses ({}x speedup)", cache_miss_queue.len(), BATCH_SIZE);
             for chunk in cache_miss_queue.chunks(BATCH_SIZE) {
                 let codes: Vec<String> = chunk.iter().map(|(_, code, _, _, _, _, _, _)| code.clone()).collect();
+                // 文档/入库侧：发送**裸源码**，禁止调用 format_query —— 否则已有向量索引全部失效
                 match self.embedding_provider.get_embeddings_batch(&codes).await {
                     Ok(embeddings) => {
                         for (item, vec) in chunk.iter().zip(embeddings) {
@@ -842,10 +953,20 @@ impl EmbeddingService {
         Ok(())
     }
 
+    /// **查询专用** helper：按配置的 instruct 把原始查询包装成官方非对称检索输入。
+    ///
+    /// 仅供检索入口调用；入库/文档路径（`process_file_content` → `get_embeddings_batch`）
+    /// 必须继续发送裸源码，否则历史 LanceDB 向量与查询向量落在不同分布。
+    pub fn format_query(&self, query: &str) -> String {
+        self.embedding_provider.format_query(query)
+    }
+
     /// Search for code blocks using semantic search
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, anyhow::Error> {
         // 1. Generate embedding for the query
-        let query_vector = self.embedding_provider.get_embedding(query).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        //    只对 query 侧注入 instruct 前缀（Qwen3-Embedding instruction-aware / 非对称检索）
+        let formatted_query = self.embedding_provider.format_query(query);
+        let query_vector = self.embedding_provider.get_embedding(&formatted_query).await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // 2. Search in LanceDB
         let table = self.connection.open_table(&self.table_name).execute().await?;
@@ -858,6 +979,8 @@ impl EmbeddingService {
             
         // 3. Parse results
         let mut search_results = Vec::new();
+        // 旧索引表可能没有 line_start 列（ensure_collection 不做列迁移），只警告一次，避免逐行刷屏
+        let mut warned_missing_line_start = false;
         
         while let Some(batch) = results_stream.try_next().await? {
             let file_path_col = batch.column_by_name("file_path").ok_or(anyhow!("Missing file_path column"))?.as_string::<i32>();
@@ -884,6 +1007,13 @@ impl EmbeddingService {
                 let symbol_type_col = batch.column_by_name("symbol_type");
                 let language_col = batch.column_by_name("language");
                 let line_start_col = batch.column_by_name("line_start");
+                if line_start_col.is_none() && !warned_missing_line_start {
+                    warn!(
+                        "LanceDB 表 '{}' 缺少 line_start 列（旧索引 schema），dense 结果的行号将为 0，建议重建索引",
+                        self.table_name
+                    );
+                    warned_missing_line_start = true;
+                }
                 let line_end_col = batch.column_by_name("line_end");
 
                 let symbol_type = symbol_type_col
@@ -995,4 +1125,360 @@ mod tests {
         Ok(())
     }
 
+    // ---- query-side instruct prefix (Qwen3-Embedding asymmetric retrieval) ----
+
+    /// ①正常指令 + 查询：与官方 `get_detailed_instruct` 模板**逐字节**一致。
+    /// `Instruct:` 冒号后有一个空格，中间是 \n，`Query:` 冒号后**没有空格**。
+    #[test]
+    fn build_instruct_query_matches_official_template_byte_for_byte() {
+        let out = build_instruct_query(
+            "Given a web search query, retrieve relevant passages that answer the query",
+            "how to parse toml",
+        );
+        assert_eq!(
+            out.as_bytes(),
+            b"Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:how to parse toml"
+        );
+        assert_eq!(
+            out,
+            "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:how to parse toml"
+        );
+        // 结构细节：前缀以 "Instruct: " 开头，"Query:" 后紧跟原文且无空格
+        assert!(out.starts_with("Instruct: "));
+        assert!(out.contains("\nQuery:how"));
+        assert!(!out.contains("Query: h"), "Query: 之后不能有空格");
+    }
+
+    /// ②instruct 为空字符串（配置显式关闭）→ 返回原查询，不加任何前缀。
+    #[test]
+    fn build_instruct_query_with_empty_instruct_returns_raw_query() {
+        assert_eq!(build_instruct_query("", "find login handler"), "find login handler");
+        assert_eq!(build_instruct_query("", "解析配置文件"), "解析配置文件");
+        // 空 instruct 绝不产生 "Instruct:" 痕迹
+        assert!(!build_instruct_query("", "q").contains("Instruct:"));
+    }
+
+    /// ③中文查询原样保留在 `Query:` 之后（不被转写、不被截断、UTF-8 完整）。
+    #[test]
+    fn build_instruct_query_keeps_chinese_query_verbatim() {
+        let instruct = "Given a code search query, retrieve relevant functions or code snippets that answer the query.";
+        let query = "如何解析全局配置文件里的嵌入模型参数？";
+        let out = build_instruct_query(instruct, query);
+        assert_eq!(
+            out.as_bytes(),
+            format!("Instruct: {instruct}\nQuery:{query}").as_bytes()
+        );
+        let (head, tail) = out.split_once('\n').expect("one newline separator");
+        assert_eq!(head, format!("Instruct: {instruct}"));
+        assert_eq!(tail, format!("Query:{query}"));
+        assert_eq!(tail.strip_prefix("Query:"), Some(query));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    /// ④空白查询：不加前缀，保持既有"空输入直接报错"的行为，避免只 embedding 指令本身。
+    #[test]
+    fn build_instruct_query_with_blank_query_returns_raw_query() {
+        assert_eq!(build_instruct_query("some instruct", ""), "");
+        assert_eq!(build_instruct_query("some instruct", "   "), "   ");
+    }
+
+    /// 默认指令必须是官方建议的英文单句（无换行），且逐字与需求一致。
+    #[test]
+    fn default_query_instruct_is_the_official_style_english_sentence() {
+        assert_eq!(
+            DEFAULT_QUERY_INSTRUCT,
+            "Given a code search query, retrieve relevant functions or code snippets that answer the query."
+        );
+        assert!(!DEFAULT_QUERY_INSTRUCT.contains('\n'));
+        assert!(DEFAULT_QUERY_INSTRUCT.is_ascii());
+    }
+
+    /// provider 层：默认 instruct 生效；with_instruct("") 关闭。
+    #[test]
+    fn provider_format_query_uses_configured_instruct() {
+        let p = OpenAICompatibleEmbeddingProvider::new(
+            "sk-not-used".to_string(),
+            Some("https://api.siliconflow.cn/v1".to_string()),
+            "Qwen/Qwen3-Embedding-4B".to_string(),
+        );
+        // new() 的缺省即默认指令
+        assert_eq!(
+            p.format_query("vector store").as_bytes(),
+            format!("Instruct: {DEFAULT_QUERY_INSTRUCT}\nQuery:vector store").as_bytes()
+        );
+        // 自定义
+        let p2 = p.with_instruct("Given a question, retrieve matching code".to_string());
+        assert_eq!(p2.format_query("abc"), "Instruct: Given a question, retrieve matching code\nQuery:abc");
+        // 显式关闭
+        let p3 = OpenAICompatibleEmbeddingProvider::new(
+            "sk-not-used".to_string(),
+            None,
+            "Qwen/Qwen3-Embedding-4B".to_string(),
+        )
+        .with_instruct(String::new());
+        assert_eq!(p3.format_query("abc"), "abc");
+    }
+
+    /// service 层查询入口把前缀委托给 provider；mock provider（恒等）不受影响。
+    #[tokio::test]
+    async fn service_format_query_delegates_to_provider() {
+        let dir = tempdir().unwrap();
+        let provider = Box::new(
+            OpenAICompatibleEmbeddingProvider::new(
+                "sk-not-used".to_string(),
+                None,
+                "Qwen/Qwen3-Embedding-4B".to_string(),
+            )
+            .with_instruct(DEFAULT_QUERY_INSTRUCT.to_string()),
+        );
+        let service =
+            EmbeddingService::new_with_provider(dir.path().to_str().unwrap(), "t".to_string(), provider)
+                .await
+                .unwrap();
+        assert_eq!(
+            service.format_query("查找索引重建入口").as_bytes(),
+            format!("Instruct: {DEFAULT_QUERY_INSTRUCT}\nQuery:查找索引重建入口").as_bytes()
+        );
+    }
+
+    /// 入库/文档路径使用的 mock provider 默认 format_query 必须是恒等（前缀是显式调用，不是隐式注入）。
+    #[tokio::test]
+    async fn mock_provider_format_query_is_identity_by_default() {
+        let dir = tempdir().unwrap();
+        let provider = Box::new(MockEmbeddingProvider::new());
+        let service =
+            EmbeddingService::new_with_provider(dir.path().to_str().unwrap(), "t2".to_string(), provider)
+                .await
+                .unwrap();
+        assert_eq!(service.format_query("fn main() {}"), "fn main() {}");
+        assert_eq!(service.format_query(""), "");
+    }
+
+    /// 端到端（不联网）：`EmbeddingService::new` 必须把 config.embedding.instruct 透传给 provider。
+    /// 缺省 → 默认指令；显式空串 → 完全不加前缀。
+    #[tokio::test]
+    async fn service_new_honours_config_instruct_three_states() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let db = dir.path().to_str().unwrap();
+
+        // 旧配置：没有 instruct 字段 → 默认指令生效
+        let cfg: Config = serde_json::from_str(
+            r#"{"embedding":{"api_token":"sk-not-used","model":"Qwen/Qwen3-Embedding-4B","dimensions":2560}}"#,
+        )?;
+        let svc = EmbeddingService::new(db, "t_default".to_string(), Some(&cfg), None).await?;
+        assert_eq!(
+            svc.format_query("find the entry point").as_bytes(),
+            format!("Instruct: {DEFAULT_QUERY_INSTRUCT}\nQuery:find the entry point").as_bytes()
+        );
+
+        // 显式空串 → 关闭注入
+        let cfg: Config = serde_json::from_str(
+            r#"{"embedding":{"api_token":"sk-not-used","dimensions":2560,"instruct":""}}"#,
+        )?;
+        let svc = EmbeddingService::new(db, "t_off".to_string(), Some(&cfg), None).await?;
+        assert_eq!(svc.format_query("find the entry point"), "find the entry point");
+
+        // 自定义指令 → 使用该指令
+        let cfg: Config = serde_json::from_str(
+            r#"{"embedding":{"api_token":"sk-not-used","dimensions":2560,"instruct":"Given a bug report, retrieve the faulty function"}}"#,
+        )?;
+        let svc = EmbeddingService::new(db, "t_custom".to_string(), Some(&cfg), None).await?;
+        assert_eq!(
+            svc.format_query("空指针崩溃"),
+            "Instruct: Given a bug report, retrieve the faulty function\nQuery:空指针崩溃"
+        );
+
+        // 维度/模型保持不变（本改动不得触碰维度、模型名、请求体结构）
+        let cfg: Config = serde_json::from_str(
+            r#"{"embedding":{"api_token":"sk-not-used","model":"Qwen/Qwen3-Embedding-4B","dimensions":2560}}"#,
+        )?;
+        let svc = EmbeddingService::new(db, "t_dims".to_string(), Some(&cfg), None).await?;
+        assert_eq!(svc.dimensions, 2560);
+        assert_eq!(svc.embedding_provider.model(), "Qwen/Qwen3-Embedding-4B");
+
+        Ok(())
+    }
+
+    // ---- 通道分层：dense 长度阈值 vs BM25 不做长度过滤 ----
+
+    /// BM25 通道不做长度过滤：极短代码块（`fn f()`、`x`）也必须被接受，
+    /// 只有 trim 后为空的块（0 个 token，入库无意义）才被排除。
+    #[test]
+    fn should_index_bm25_accepts_short_code() {
+        for short in ["fn f()", "x", "}", "id", "useState"] {
+            assert!(
+                should_index_bm25(short),
+                "短代码块 {short:?} 必须被 BM25 通道接受（BM25 无长度阈值）"
+            );
+        }
+        // 空文本 / 纯空白：产生 0 个 token，写入索引没有意义
+        assert!(!should_index_bm25(""), "空块不得进入 BM25");
+        assert!(!should_index_bm25("   \n\t "), "纯空白块不得进入 BM25");
+    }
+
+    /// dense 阈值按 trim 后的字符数比较：9 字符块在 min=16 时被过滤，长块通过；
+    /// min=0 时非空块一律通过（与原 `count < min` 判据等价，dense 行为不变）。
+    #[test]
+    fn should_index_dense_respects_threshold() {
+        let short = "fn f() {}";
+        assert_eq!(short.chars().count(), 9);
+        assert!(
+            !should_index_dense(short, 16),
+            "9 字符块在 min=16 时必须被 dense 通道过滤"
+        );
+
+        let long = "fn long_function_name() -> usize { 42 }";
+        assert!(long.chars().count() >= 16);
+        assert!(
+            should_index_dense(long, 16),
+            "长代码块必须通过 dense 阈值"
+        );
+
+        // 阈值为 0 → 非空块全部通过
+        assert!(should_index_dense(short, 0));
+        assert!(should_index_dense(long, 0));
+
+        // 中文块按字符数而非字节数判断：11 字符（33 字节）在 min=16 时仍需过滤
+        let chinese = "函数定义示例代码块内容";
+        assert_eq!(chinese.chars().count(), 11);
+        assert!(
+            chinese.len() > 16,
+            "该中文块字节数已超过阈值，字符数才是判据"
+        );
+        assert!(
+            !should_index_dense(chinese, 16),
+            "dense 阈值必须按字符数而不是字节数判断"
+        );
+    }
+
+    /// 缺陷回归用例：短代码块不得因 dense 阈值被 BM25 通道丢弃。
+    /// 正确分层是「只进 BM25、不进 dense」，而不是「两通道都不进」。
+    #[test]
+    fn short_code_goes_to_bm25_but_not_dense() {
+        let code_block = "x";
+        assert_eq!(code_block.chars().count(), 1);
+
+        assert!(
+            should_index_bm25(code_block),
+            "短代码不得因 dense 阈值被 BM25 丢弃：BM25 通道必须接受 {code_block:?}"
+        );
+        assert!(
+            !should_index_dense(code_block, 16),
+            "同一个块仍应被 dense 阈值过滤（dense 侧行为保持不变）"
+        );
+        // 两个判据互相独立：BM25 为真、dense 为假 —— 即「只进 BM25」
+        assert_ne!(
+            should_index_bm25(code_block),
+            should_index_dense(code_block, 16),
+            "短代码应恰好落在「只进 BM25、不进 dense」的分层区间"
+        );
+    }
+
+    // ---- truncate_to_byte_limit ----
+
+    /// 纯 ASCII 超长串：截断到恰好等于字节上限。
+    #[test]
+    fn truncate_to_byte_limit_ascii_over_limit() {
+        let limit = MAX_EMBEDDING_INPUT_BYTES;
+        let mut s = String::with_capacity(limit + 1_000);
+        for _ in 0..(limit + 1_000) {
+            s.push('a');
+        }
+        assert_eq!(s.len(), limit + 1_000);
+
+        let t = truncate_to_byte_limit(&s, limit);
+        assert_eq!(t.len(), limit);
+        assert!(s.starts_with(t));
+        assert!(t.is_char_boundary(t.len()));
+    }
+
+    /// 多字节字符（中文，3 字节）恰好跨越 64_000 字节边界：不 panic，回退到合法前缀。
+    #[test]
+    fn truncate_to_byte_limit_multibyte_straddling_limit() {
+        let limit = MAX_EMBEDDING_INPUT_BYTES;
+        // '中' 占 3 字节，起点放在 limit - 2，使其内部覆盖 limit 这个切点。
+        let mut s = String::with_capacity(limit + 16);
+        for _ in 0..(limit - 2) {
+            s.push('a');
+        }
+        s.push('中');
+        for _ in 0..8 {
+            s.push('b');
+        }
+        assert_eq!(s.len(), limit - 2 + 3 + 8);
+        assert!(!s.is_char_boundary(limit));
+
+        let t = truncate_to_byte_limit(&s, limit);
+        assert!(t.len() <= limit, "truncated len {} exceeds limit {}", t.len(), limit);
+        assert_eq!(t.len(), limit - 2, "should fall back to the preceding char boundary");
+        assert!(s.starts_with(t), "result must be a lossless prefix of the input");
+        assert!(t.is_char_boundary(t.len()));
+    }
+
+    /// 4 字节 emoji 跨越边界：同样回退，不 panic。
+    #[test]
+    fn truncate_to_byte_limit_emoji_straddling_limit() {
+        let limit = MAX_EMBEDDING_INPUT_BYTES;
+        let mut s = String::with_capacity(limit + 16);
+        for _ in 0..(limit - 1) {
+            s.push('a');
+        }
+        s.push('😀'); // 4 字节，覆盖 limit-1 .. limit+3
+        for _ in 0..4 {
+            s.push('c');
+        }
+        assert!(!s.is_char_boundary(limit));
+
+        let t = truncate_to_byte_limit(&s, limit);
+        assert_eq!(t.len(), limit - 1);
+        assert!(t.len() <= limit);
+        assert!(s.starts_with(t));
+    }
+
+    /// max_bytes = 0：非空串返回空串，空串返回空串。
+    #[test]
+    fn truncate_to_byte_limit_zero_max_bytes() {
+        assert_eq!(truncate_to_byte_limit("hello", 0), "");
+        assert_eq!(truncate_to_byte_limit("中文", 0), "");
+        assert_eq!(truncate_to_byte_limit("", 0), "");
+    }
+
+    /// s.len() <= max_bytes：原样返回（同一块缓冲区，长度不变）。
+    #[test]
+    fn truncate_to_byte_limit_within_limit_returns_original() {
+        let mut s = String::new();
+        for _ in 0..256 {
+            s.push('中');
+        }
+        let exact = s.as_str();
+        // 恰好等于上限 —— 原样返回
+        assert_eq!(truncate_to_byte_limit(exact, s.len()).as_ptr(), exact.as_ptr());
+        assert_eq!(truncate_to_byte_limit(exact, s.len()).len(), s.len());
+        // 上限大于长度 —— 原样返回
+        assert_eq!(truncate_to_byte_limit(exact, s.len() + 1).as_ptr(), exact.as_ptr());
+        // 空串在任何正上限下都是空串
+        assert_eq!(truncate_to_byte_limit("", 10), "");
+    }
+
+    /// max_bytes 落在首个字符内部（"中" 的 max_bytes = 1）：回退到 0，返回空串。
+    #[test]
+    fn truncate_to_byte_limit_first_char_straddles_limit() {
+        assert_eq!(truncate_to_byte_limit("中", 1), "");
+        assert_eq!(truncate_to_byte_limit("中", 2), "");
+        assert_eq!(truncate_to_byte_limit("中", 3), "中");
+        assert_eq!(truncate_to_byte_limit("😀a", 2), "");
+    }
+
+    /// 截断后的字节必须是合法 UTF-8（用 from_utf8 反证，确保不会切开多字节序列）。
+    #[test]
+    fn truncate_to_byte_limit_result_is_valid_utf8() {
+        let mut s = String::new();
+        for _ in 0..30_000 {
+            s.push_str("中文😀");
+        }
+        let t = truncate_to_byte_limit(&s, MAX_EMBEDDING_INPUT_BYTES);
+        assert!(t.len() <= MAX_EMBEDDING_INPUT_BYTES);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+        assert!(s.starts_with(t));
+    }
 }

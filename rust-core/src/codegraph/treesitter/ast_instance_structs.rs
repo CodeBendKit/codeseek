@@ -66,6 +66,23 @@ impl TypeDef {
         types
     }
 
+    /// Phase P2a 交付物 1 的取名辅助：把一个 `TypeDef` 规范成**单个类型标识符**。
+    ///
+    /// 只用于 `resolution` 的 L3 receiver 类型推断，不参与任何序列化/图产出。
+    /// 取名顺序：
+    /// 1. 自己的 `name`（非空、且不是 `parse_type` 给元组塞的占位名 `"tuple"`）；
+    /// 2. 否则退到**第一个**有名字的嵌套类型（`Vec<Calc>` → `Calc`、`tuple` → 首个元素类型）。
+    /// 两者都拿不到 ⇒ `None`，调用方必须按"信息不足"下沉，**绝不猜**。
+    pub fn binding_type_name(&self) -> Option<&str> {
+        if let Some(name) = self.name.as_deref() {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && trimmed != "tuple" {
+                return Some(trimmed);
+            }
+        }
+        self.nested_types.iter().find_map(TypeDef::binding_type_name)
+    }
+
     pub fn mutate_nested_types<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut TypeDef),
@@ -356,6 +373,99 @@ pub trait AstSymbolInstance: Debug + Send + Sync + Any {
 
     fn is_error(&self) -> bool {
         self.fields().is_error
+    }
+
+    // ============================================================================================
+    // Phase P1 交付物 1：import 原料的专用只读接口。
+    //
+    // 背景：`ImportDeclaration` 的 path_components / alias / import_type / filepath_ref 四个字段
+    // 一直存在于 AST 层，但通用 trait 上没有 getter，导致上层（parser.rs 的两处 symbol_type
+    // 匹配循环）只能看到 `name()` 为空串 —— P0 基线测试正是用这个空串断言锁住了该缺口。
+    //
+    // 这里全部提供**带默认实现**的方法：非 import 符号一律返回空值，因此 7 个语言结构体
+    // 无需任何改动；只有 `ImportDeclaration` 的 impl 覆盖为返回真实字段。
+    // 返回类型刻意不含泛型/`Self`，以保持对象安全（`typetag` + `dyn_partial_eq` 的前提）。
+    // ============================================================================================
+
+    /// import 路径的各段（Rust `use a::b::c` → ["a","b","c"]；Java `import a.b.C` → ["a","b","C"]）。
+    fn import_path_components(&self) -> &[String] {
+        &[]
+    }
+
+    /// 显式别名（Rust `use a::b as c` / Python `from x import y as z` / JS `import {a as b}`）。
+    fn import_alias(&self) -> Option<&str> {
+        None
+    }
+
+    /// import 的类别（系统 / 三方库 / 用户模块 / 未知）。返回 owned 值：`ImportType` 只有 `Clone`。
+    fn import_type(&self) -> Option<ImportType> {
+        None
+    }
+
+    /// 已解析到的文件路径（当前各语言 parser 均未填充，保留接口给 P2 的真实模块解析）。
+    fn import_filepath_ref(&self) -> Option<&PathBuf> {
+        None
+    }
+
+    // ============================================================================================
+    // Phase P1 交付物 2(a)：方法调用 receiver 的只读接口。
+    //
+    // `rust.rs` 的 field_expression 分支过去只把方法名写进 `name`，receiver 退化成一个
+    // 独立的 `VariableUsage` 符号（源码注释自称 "dirty hack"）；现在同时把 receiver 的源码
+    // 文本记在调用符号自己的 `receiver` 字段上。默认 `None` → 其它符号类型无需改动。
+    // ============================================================================================
+
+    /// 调用点 receiver 的源码文本（`calc.add(x)` → Some("calc")）；非方法调用返回 `None`。
+    fn call_receiver(&self) -> Option<&str> {
+        None
+    }
+
+    /// 函数定义的形参个数（`FunctionDeclaration.args.len()`）。
+    ///
+    /// Phase P1 交付物 3 需要它来给 `resolution::FunctionTag.param_count` 赋值
+    /// —— 当前图里 `FunctionInfo.signature` 只是函数名的副本（`parser.rs` 两处都是
+    /// `signature: Some(symbol_ref.name())`），完全没有参数信息，arity 消歧无从下手。
+    /// 默认 `None`：只有 `FunctionDeclaration` 覆盖，其余符号类型无需改动。
+    fn param_count(&self) -> Option<usize> {
+        None
+    }
+
+    // ============================================================================================
+    // Phase P2a 交付物 1 的原料：receiver 类型推断（L3 ReceiverTypeMember）需要的"形参名 → 类型名"。
+    //
+    // 为什么不能再复用 `types()`：`FunctionDeclaration::types()` 把 **返回类型排在最前**，
+    // 且会把嵌套类型展开成多元素（`Vec<TypeDef>`），与 `args` **没有下标对应关系**，
+    // 因此无法回答"这个调用点的 receiver `calc` 是哪来的、类型是什么"。
+    // 而 `args` 里每个 `FunctionArg { name, type_ }` 恰好就是 P2a 允许的三种推断方式之一
+    // （"函数形参 `v: T` / `T v`"）。
+    //
+    // 与 P1 的 import/receiver getter 同一取向：**带默认实现**（非函数声明返回空），
+    // 只读、不改任何符号、不改序列化形状，因此 `tests/parsers` 的 `compare_symbols`
+    // 与 skeletonizer/declaration_formatter 的精确断言完全不受影响。
+    // ============================================================================================
+
+    /// 形参名 → 规范化类型名（`fn f(calc: &Calc)` → `[("calc", "Calc")]`）。
+    ///
+    /// 类型名规范化：优先 `TypeDef.name`；无名时退到第一个有名字的嵌套类型（如
+    /// `Vec<Calc>`/`&dyn Runner` 这类别名/引用形式在 `parse_type` 里已经被剥成内层名字）。
+    /// 无类型标注的形参（C 风格 `T v` 之外的大多数动态语言）不进结果集 —— **宁缺毋滥**，
+    /// P2a 的 L3 判据要求"推不出类型必须下沉不许猜"。
+    fn param_bindings(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+
+    /// 该函数声明是否**带函数体**（`definition_range` 非空）。
+    ///
+    /// 这是 P2a 区分"具体实现"与"抽象签名"的唯一可用信号：
+    /// `rust.rs::parse_function_declaration` 只在存在 `body` 节点时才写 `definition_range`，
+    /// 所以 trait 方法 `fn run(&self) -> i32;`（`tests/fixtures/resolution/ambiguous_trait_impl/runners.rs:6`）
+    /// 的 `definition_range` 是默认零区间。
+    ///
+    /// 用途：L3 命中一个"无体的抽象签名"时**不得**声称唯一解析成功 ——
+    /// AST 里没有 impl→trait 的反向链接，无法枚举实现者，只能拒绝唯一判定并下沉。
+    /// 默认 `true`：非函数声明符号一律视为"有体"，不影响任何既有行为。
+    fn has_definition_body(&self) -> bool {
+        true
     }
 
     fn remove_linked_guids(&mut self, guids: &HashSet<Uuid>) {
@@ -729,6 +839,24 @@ impl AstSymbolInstance for ImportDeclaration {
     fn symbol_type(&self) -> SymbolType {
         SymbolType::ImportDeclaration
     }
+
+    // ---- Phase P1 交付物 1：覆盖 trait 默认实现，把原本"拿不到"的四个 import 原料暴露出去 ----
+
+    fn import_path_components(&self) -> &[String] {
+        &self.path_components
+    }
+
+    fn import_alias(&self) -> Option<&str> {
+        self.alias.as_deref()
+    }
+
+    fn import_type(&self) -> Option<ImportType> {
+        Some(self.import_type.clone())
+    }
+
+    fn import_filepath_ref(&self) -> Option<&PathBuf> {
+        self.filepath_ref.as_ref()
+    }
 }
 
 
@@ -950,6 +1078,40 @@ impl AstSymbolInstance for FunctionDeclaration {
     fn symbol_type(&self) -> SymbolType {
         SymbolType::FunctionDeclaration
     }
+
+    /// Phase P1 交付物 3：暴露形参个数供 `resolution::FunctionTag` 使用。
+    fn param_count(&self) -> Option<usize> {
+        Some(self.args.len())
+    }
+
+    /// Phase P2a 交付物 1：形参名 → 类型名（L3 receiver 类型推断的唯一"形参"来源）。
+    ///
+    /// 只做**规范化取名**，不做任何跨文件/跨作用域推断；无名或无类型的形参直接跳过，
+    /// 让上层 `resolution` 走"信息不足即下沉"的分支。
+    fn param_bindings(&self) -> Vec<(String, String)> {
+        self.args
+            .iter()
+            .filter_map(|arg| {
+                let type_name = arg
+                    .type_
+                    .as_ref()
+                    .and_then(TypeDef::binding_type_name)?
+                    .to_string();
+                if arg.name.is_empty() || type_name.is_empty() {
+                    return None;
+                }
+                Some((arg.name.clone(), type_name))
+            })
+            .collect()
+    }
+
+    /// Phase P2a 交付物 1：trait/abstract 方法（只有签名、没有 body）→ `false`。
+    ///
+    /// `definition_range` 由 `rust.rs`（及 Java/Go/TS 等各语言 parser）仅在存在 body 节点时写入，
+    /// 默认值是零区间，因此 `start_byte == end_byte` 即"没有函数体"。
+    fn has_definition_body(&self) -> bool {
+        self.ast_fields.definition_range.start_byte != self.ast_fields.definition_range.end_byte
+    }
 }
 
 
@@ -1011,6 +1173,17 @@ FunctionCall
 pub struct FunctionCall {
     pub ast_fields: AstSymbolFields,
     pub template_types: Vec<TypeDef>,
+    /// Phase P1 交付物 2(a)：方法调用 receiver 的**源码文本**（`calc.add(x)` → `Some("calc")`）。
+    ///
+    /// 为什么新开一个字段而不是复用 `ast_fields.namespace`：
+    /// `namespace` 已被 `rust.rs` 的 `scoped_identifier` 分支用于模块路径（`mod_a::pick`），
+    /// 两者语义不同，混用会让 P2 无法区分"包/模块限定"与"对象 receiver"；
+    /// 且 P0 基线第 3、5 两项分别断言 `namespace == ""`，改写 namespace 会直接打穿基线。
+    ///
+    /// `#[serde(default)]` 保证旧的参考 JSON fixture（没有该键）仍能反序列化；
+    /// `skip_serializing_if` 保证 `None` 时序列化字节与改造前逐字节一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
 }
 
 impl Default for FunctionCall {
@@ -1018,6 +1191,7 @@ impl Default for FunctionCall {
         Self {
             ast_fields: AstSymbolFields::default(),
             template_types: vec![],
+            receiver: None,
         }
     }
 }
@@ -1111,6 +1285,11 @@ impl AstSymbolInstance for FunctionCall {
 
     fn symbol_type(&self) -> SymbolType {
         SymbolType::FunctionCall
+    }
+
+    /// Phase P1 交付物 2(a)：覆盖 trait 默认实现，暴露 receiver 源码文本。
+    fn call_receiver(&self) -> Option<&str> {
+        self.receiver.as_deref()
     }
 }
 

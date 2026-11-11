@@ -59,6 +59,20 @@ impl CodeChunk {
     }
 }
 
+/// Parse `{file_path}#{line_start}#{symbol_name}` back into its parts.
+/// Splits from the right so a file path containing '#' still parses correctly.
+///
+/// 与 [`CodeChunk::generate_id`] 互为反函数（右起分割优先，因此路径中的 `#`
+/// 不会破坏解析；符号名本身含 `#` 时会被并入符号名段）。
+/// 行号文本无法解析为 `usize` 时返回 `None`，由调用方决定回退值。
+pub fn parse_snippet_id(snippet_id: &str) -> Option<(&str, usize, &str)> {
+    // 先右切一次拿到 symbol_name，再对剩余部分右切一次拿到 line_start 文本
+    let (head, symbol_name) = snippet_id.rsplit_once('#')?;
+    let (file_path, line_start_text) = head.rsplit_once('#')?;
+    let line_start = line_start_text.parse::<usize>().ok()?;
+    Some((file_path, line_start, symbol_name))
+}
+
 /// 稀疏通道（BM25）的搜索结果
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextSearchResult {
@@ -129,4 +143,46 @@ pub trait TextSearchProvider: Send + Sync {
 
     /// 返回索引中的文档总数。用于判断索引是否为空。
     async fn document_count(&self) -> anyhow::Result<usize>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_snippet_id_returns_parts() {
+        assert_eq!(
+            parse_snippet_id("/tmp/a.rs#42#foo"),
+            Some(("/tmp/a.rs", 42, "foo"))
+        );
+    }
+
+    #[test]
+    fn parse_snippet_id_handles_hash_in_file_path() {
+        // 右起分割：路径里的 '#' 不应破坏解析
+        assert_eq!(
+            parse_snippet_id("/tmp/weird#name.rs#7#bar"),
+            Some(("/tmp/weird#name.rs", 7, "bar"))
+        );
+    }
+
+    #[test]
+    fn parse_snippet_id_rejects_malformed_input() {
+        assert_eq!(parse_snippet_id("nohash"), None);
+        assert_eq!(parse_snippet_id("a#notanumber#b"), None);
+        assert_eq!(parse_snippet_id(""), None);
+        assert_eq!(parse_snippet_id("a.rs#1"), None);
+    }
+
+    #[test]
+    fn parse_snippet_id_round_trips_generate_id() {
+        let id = CodeChunk::generate_id("/tmp/a.rs", 10, "foo");
+        assert_eq!(parse_snippet_id(&id), Some(("/tmp/a.rs", 10, "foo")));
+
+        let chunk = CodeChunk::new("/tmp/weird#name.rs", "fn f() {}", "bar", "function", "rust", 7, 9);
+        assert_eq!(
+            parse_snippet_id(&chunk.snippet_id),
+            Some(("/tmp/weird#name.rs", 7, "bar"))
+        );
+    }
 }

@@ -18,6 +18,15 @@ use crate::codegraph::treesitter::parsers::utils::{CandidateInfo, get_guid};
 
 pub(crate) struct JavaParser {
     pub parser: Parser,
+    /// Phase P1 交付物 2(b)：`package a.b.c;` 里解析出来的包名分段（`["a","b","c"]`）。
+    ///
+    /// 改造前 `"package_declaration" => {}` 是**空分支**，包名被彻底丢弃，导致 Java 文件的
+    /// module path 无法推导。这里把原料留住，但**不产出任何新符号** —— 因为
+    /// `tests/parsers/mod.rs` 的 `compare_symbols` 仍在断言 `childs_guid().len()` 与
+    /// `parent_guid` 的对称性（mod.rs:214/225），新增符号会改变父子计数。
+    ///
+    /// 每次 `parse()` 入口重置（见 `AstLanguageParser::parse` 的实现），因此不会跨文件残留。
+    pub package_components: Option<Vec<String>>,
 }
 
 static JAVA_KEYWORDS: [&str; 50] = [
@@ -221,7 +230,36 @@ impl JavaParser {
         parser
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .map_err(internal_error)?;
-        Ok(JavaParser { parser })
+        Ok(JavaParser {
+            parser,
+            package_components: None,
+        })
+    }
+
+    /// Phase P1 交付物 2(b)：从 `package_declaration` 节点取出包名并记录到 `package_components`。
+    ///
+    /// 只认**直接子节点**里的 `scoped_identifier` / `identifier`：`package` 关键字自身的 kind
+    /// 是 `"package"`，注解是 `"annotation"`/`"marker_annotation"`，分号是 `";"`，
+    /// 因此不会误取到非包名文本。本方法**不产出任何符号**。
+    fn record_package_declaration(&mut self, node: &Node, code: &str) {
+        for i in 0..node.child_count() {
+            let child = match node.child(i) {
+                Some(c) => c,
+                None => continue,
+            };
+            if matches!(child.kind(), "scoped_identifier" | "identifier") {
+                let components: Vec<String> = code
+                    .slice(child.byte_range())
+                    .split('.')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !components.is_empty() {
+                    self.package_components = Some(components);
+                }
+                return;
+            }
+        }
     }
 
     pub fn parse_struct_declaration<'a>(
@@ -540,6 +578,24 @@ impl JavaParser {
                         }
                     }
                 }
+                // Phase P1 交付物 3 的原料保真修复（与交付物 2 同源，最小侵入）：
+                // 改造前 `import java.util.*;` 的 `*` 既不是 scoped_identifier 也不是 identifier
+                // （tree-sitter 把它挂在 scoped_identifier 之外），于是通配符标记被**彻底丢弃**，
+                // `path_components` 与 `import java.util;` 一模一样 —— 上层无法判断这是通配符导入。
+                // 这里按整条语句的源码文本补一个末段 `"*"`：
+                //  - **不新增/删除任何符号**，symbol 数量、类型分布、guid/父子关系全部不变；
+                //  - ImportDeclaration 在 `codegraph/parser.rs` 的两处 `symbol_type()` 匹配里
+                //    落 `_ => {}`，从来不参与建边，因此调用边语义零影响；
+                //  - `path_components` 在本文件里只被 `.first()` 读去判 SYSTEM_MODULES（不受末段影响），
+                //    全仓没有其他读取点，故不存在别的消费方被这个末段打穿。
+                // 通配符判定见 `codegraph::resolution::ImportEntry::from_symbol`（is_wildcard）。
+                if def.path_components.last().map(|l| l != "*").unwrap_or(true) {
+                    let statement = code.slice(info.node.byte_range()).trim_end();
+                    let statement = statement.trim_end_matches(';').trim_end();
+                    if statement.ends_with(".*") || statement.ends_with('*') {
+                        def.path_components.push("*".to_string());
+                    }
+                }
                 def.ast_fields.full_range = info.node.range();
                 def.ast_fields.parent_guid = Some(info.parent_guid.clone());
                 def.ast_fields.guid = get_guid();
@@ -558,7 +614,12 @@ impl JavaParser {
                     });
                 }
             }
-            "package_declaration" => {}
+            "package_declaration" => {
+                // Phase P1 交付物 2(b)：改造前这里是 `"package_declaration" => {}`（空分支），
+                // Java 的包名被完全丢弃。现在解析出来记到 parser 自身的字段里，
+                // **不新增/删除任何符号**，因此 `symbols` 规模与类型分布逐字节不变。
+                self.record_package_declaration(&info.node, code);
+            }
             _ => {
                 for i in 0..info.node.child_count() {
                     let child = info.node.child(i).unwrap();
@@ -794,8 +855,17 @@ impl JavaParser {
 
 impl AstLanguageParser for JavaParser {
     fn parse(&mut self, code: &str, path: &PathBuf) -> Vec<AstSymbolInstanceArc> {
+        // Phase P1 交付物 2(b)：每次解析重置包名。
+        // `TreeSitterParser::parse_file` 目前是"每个文件新建一个 parser 实例"，
+        // 但这里不依赖该前提 —— 显式重置保证同一实例复用时绝不会跨文件残留上一个包的名称。
+        self.package_components = None;
         let tree = self.parser.parse(code, None).unwrap();
         let symbols = self.parse_(&tree.root_node(), code, path);
         symbols
+    }
+
+    /// Phase P1 交付物 2(b)：透出 `package a.b.c;` 的包名分段（改造前该信息被完全丢弃）。
+    fn parsed_package(&self) -> Option<Vec<String>> {
+        self.package_components.clone()
     }
 }
