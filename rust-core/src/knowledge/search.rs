@@ -1,4 +1,12 @@
 //! Hybrid search for knowledge entries: vector (LanceDB) + BM25 (Tantivy) + RRF fusion.
+//!
+//! 本模块只提供**通道无关**的融合原语（[`rrf_fuse`] / [`build_result`]）+ 结果结构体，
+//! 真正的双通道编排在 [`crate::knowledge::store::KnowledgeStore::search`]：
+//!
+//! - 两个通道（向量 / BM25）必须拿到**相同**的召回预算 `K_recall`，否则一方候选更多，
+//!   在 RRF 里天然占优，融合就是非对称的；
+//! - 传给 [`rrf_fuse`] 的 `limit` 应大于最终要返回的条数（知识库用 `K_recall × 2` 作为
+//!   融合池上界），这样「某个 id 在存储侧已缺失」时装配阶段还能用后续候选补齐。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,6 +35,10 @@ const RRF_K: f64 = 60.0;
 ///
 /// Both `vector_results` and `bm25_results` are expected to be sorted
 /// by relevance (best first). Each entry is identified by its record ID.
+///
+/// `limit` 是**融合池**上界，不一定是最终返回条数：调用方应传一个大于 `K_final` 的
+/// 池大小（知识库用 `K_recall × 2`），这样某个 id 在存储侧缺失、装配阶段被跳过时，
+/// 仍然有后备候选可以补齐到 `K_final`。
 pub fn rrf_fuse(
     vector_results: Vec<(String, f32)>,
     bm25_results: Vec<(String, f32)>,
