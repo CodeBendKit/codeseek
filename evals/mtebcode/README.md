@@ -46,7 +46,7 @@ all **3,000** queries — and all shards of one language **share one corpus dire
                                        ▼
    ┌──────────────────────────────────────────────────────────────────────────────────────┐
    │ run ─ 1. serial:     codeseek init            (once per corpus, resumable)            │
-   │     ─ 2. concurrent: codeseek search "<query text>" --json --limit K   (cwd=corpus)   │
+   │     ─ 2. concurrent: codeseek search --json --limit K -- "<query text>"   (cwd=corpus)   │
    │           adapter.parse_json_tolerant -> results                                      │
    │           write raw/<task_id>.json            (resumable runs)                        │
    │     ─ 3. score:  resolve doc_ids -> dedup keep-first -> nDCG@10 / recall / MRR        │
@@ -129,6 +129,12 @@ python3 -m mtebcode_eval score --workdir /tmp/mtebcode-csn --limit 20 --k 10
    (default 0.15 s) and a failing page is retried up to `--retries` times with exponential backoff
    (1 s, 2 s, 4 s …). When a local HF parquet cache holds the `(config, split)` pair it is read **from disk**
    instead, which is the practical answer to `429 Too Many Requests`.
+   **The on-disk page cache is keyed by `(offset, length)`, and that is load-bearing.** `probe_id_scheme` reads
+   the same offsets with `length = 1`; if the cache ignored `length`, `iter_rows` would get that 1-row page back
+   for the full page, advance `offset += 100`, and silently drop 99 rows. That is exactly the historical bug that
+   made each CodeSearchNet language yield 901 instead of 1,000 queries (missing `501..599`, because
+   `num_rows // 2 == 500`): `rows()` therefore both keys on `length` **and** re-fetches any cached page that is
+   shorter than requested without being the last page.
 2. **Task screening comes before sampling.** A task is only usable when three things hold: the queries are short
    enough to be a realistic search query, the corpus text is actually code, and the corpus is materializable
    into an extension codeseek indexes. The current task set is the **100-shard
@@ -165,9 +171,12 @@ python3 -m mtebcode_eval score --workdir /tmp/mtebcode-csn --limit 20 --k 10
    `CodeEditSearchRetrieval` corpus was a unified diff and needed `TaskSpec.diff_postimage`; that helper and its
    unit tests are kept, but **no registered task uses it any more**.
 6. **The search call.** Exactly one process per query:
-   `[binary, "search", query_text, "--json", "--limit", str(K)]` with `cwd = <corpus_dir>` and **no shell**
-   (an argv list, `shell=False`), so a query containing quotes or `$` cannot be reinterpreted. A non-zero exit,
-   a timeout, or unparsable JSON is recorded as an error for that query and the run continues.
+   `[binary, "search", "--json", "--limit", str(K), "--", query_text]` with `cwd = <corpus_dir>` and **no shell**
+   (an argv list, `shell=False`), so a query containing quotes or `$` cannot be reinterpreted. The query goes
+   **after `--`** because it is a positional argument: CodeSearchNet contains queries that start with `-`
+   (a whole line of `-----`), which clap would otherwise reject as an unknown flag with exit code 2
+   (`error: unexpected argument '-----…' found`). A non-zero exit, a timeout, or unparsable JSON is recorded
+   as an error for that query and the run continues.
 7. **Result -> `doc_id`, four levels of fallback**, then dedup. For each result element:
    (1) `file_path` / `path`, normalised to a POSIX path **relative to `corpus_dir`** (absolute paths, `./`
    prefixes and paths already containing `corpus_dir` are all handled), is looked up in `docmap`;
@@ -254,7 +263,7 @@ evals/mtebcode/
 
 ```
 /tmp/mtebcode-csn/
-├── cache/                       # one JSON page per (dataset, config, split, offset)
+├── cache/                       # one JSON page per (dataset, config, split, offset, length)
 ├── corpora/<corpus_key|task_slug>/    # CSN shards use csn-go / csn-java / csn-python (shared!)
 │   ├── docs/<stem>_<sha1[:8]>.<ext>   # the pooled (or full-corpus) documents, as real files
 │   └── docmap.json                    # {relative path -> doc_id}
@@ -275,7 +284,7 @@ evals/mtebcode/
   remaining corpora still run; `init_failures` is written into `meta`.
 - **Many `unknown_empty` in the report?** Check in this order: (1) **is the adaptive cutoff still enabled?** this is
   by far the most common cause — `mean_returned ≈ 1` with `unknown_empty` in the dozens is the signature;
-  (2) does `cd <corpus> && codeseek init && codeseek search "…" --json --limit 20` return anything by hand
+  (2) does `cd <corpus> && codeseek init && codeseek search --json --limit 20 -- "…"` return anything by hand
   (index not built, binary mismatch); (3) are the queries extremely long — the retrieval backend degrades on
   very long input; (4) did `docmap.json` get written — a missing or empty docmap is reported in `per_query.error`.
 - **`429 Too Many Requests` from `/rows`**: lower the request rate with a larger `--rate-limit`, or point

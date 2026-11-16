@@ -773,7 +773,7 @@ def _check_end_to_end(checker: _Checker) -> None:
 
 
 def _check_cli_and_robustness(checker: _Checker) -> None:
-    _section("[6/6] CLI 装配 / 错误路径 / --limit-queries 语义")
+    _section("[6/7] CLI 装配 / 错误路径 / --limit-queries 语义")
 
     from . import cli
 
@@ -873,6 +873,145 @@ def _check_cli_and_robustness(checker: _Checker) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 回归：MTEB 全量跑暴露的三个缺陷（全部离线可测）
+# ---------------------------------------------------------------------------
+
+
+def _check_regressions(checker: _Checker) -> None:
+    """锁定「全量 100 分片」跑出来的三个缺陷，防止回归。
+
+    对应实测现象（codeseek v0.1.31 + mteb/CodeSearchNetRetrieval）：
+
+    * java 分片报 ``error: unexpected argument '-----...' found``（退出码 2）；
+    * 每语言只有 901 条 query（应 1000），缺失区间恰为 ``501..599``；
+    * python 分片 panic 在 ``tantivy_index.rs:593``。
+    """
+    _section("[7/7] 回归：search argv 的 `--` 分隔 / /rows 缓存丢行 / 分片并集 = 1000")
+
+    # ---- 1) query 以 `-` 开头时，adapter 必须把 query 放到 `--` 之后 ----
+    captured: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def _fake_run(argv, **_kwargs):  # noqa: ANN001, ANN003 - 只关心 argv
+        captured.append(list(argv))
+        return _Completed()
+
+    # 真实出现的四类查询：整行分隔线、以 `-` 开头的单词、长得像 flag 的文本、普通查询
+    queries = [
+        "-----------------------------------",
+        "-not-a-flag",
+        "--limit",
+        "Flattens an Iterable and returns a List",
+    ]
+    original_run = adapter.subprocess.run
+    adapter.subprocess.run = _fake_run  # type: ignore[assignment]
+    try:
+        outcomes = [adapter.search(Path("/bin/true"), Path("."), query, limit=20) for query in queries]
+    finally:
+        adapter.subprocess.run = original_run  # type: ignore[assignment]
+
+    checker.check(
+        "adapter.search：query 一律位于 `--` 之后（clap 不再把它当 flag）",
+        len(captured) == len(queries)
+        and all(
+            argv[:2] == ["/bin/true", "search"] and argv[argv.index("--") + 1 :] == [query]
+            for argv, query in zip(captured, queries)
+        ),
+        "; ".join(" ".join(argv) for argv in captured[:1]),
+    )
+    checker.check(
+        "adapter.search：`--json` / `--limit` 全部排在 `--` 之前（选项先于位置参数）",
+        all(
+            "--json" in argv
+            and "--limit" in argv
+            and argv.index("--json") < argv.index("--")
+            and argv.index("--limit") < argv.index("--")
+            for argv in captured
+        ),
+    )
+    checker.check(
+        "adapter.search：`[]` 解析为空结果且无 error（降级路径不被误判成失败）",
+        all(outcome.results == [] and not outcome.error for outcome in outcomes),
+        (outcomes[0].error or "")[:60],
+    )
+
+    # ---- 2) /rows 磁盘缓存必须按 (offset, length) 分键，否则 probe 污染整页 ----
+    with tempfile.TemporaryDirectory(prefix="mtebcode-rows-cache-") as tmp:
+        client = data.DatasetClient(workdir=Path(tmp), quiet=True)
+        table = [{"row": {"_id": str(index)}} for index in range(1000)]
+
+        def _fake_fetch_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert path == "/rows", path
+            offset = int(params["offset"])
+            length = int(params["length"])
+            return {"rows": table[offset : offset + length], "num_rows_total": len(table)}
+
+        client._fetch_json = _fake_fetch_json  # type: ignore[method-assign]
+
+        # probe_id_scheme 的真实调用形态：同一 offset 先用 length=1 探一次
+        probe = client.rows("ds", "cfg", "test", 500, 1)
+        page = client.rows("ds", "cfg", "test", 500, data.PAGE_SIZE)
+        checker.check(
+            "rows 缓存按 (offset, length) 分键：length=1 的探测不会让整页只剩 1 行",
+            len(probe.get("rows") or []) == 1 and len(page.get("rows") or []) == data.PAGE_SIZE,
+            f"probe={len(probe.get('rows') or [])} page={len(page.get('rows') or [])}",
+        )
+
+        collected = [
+            row for chunk in data.iter_rows(client, "ds", "cfg", "test", len(table)) for row in chunk
+        ]
+        got = [row["_id"] for row in collected]
+        checker.check(
+            "iter_rows 遍历 1000 行不丢行（历史缺陷：offset=500 页命中 length=1 缓存 → 丢 501..599）",
+            got == [str(index) for index in range(1000)],
+            f"{len(got)} 行 / 唯一 {len(set(got))}",
+        )
+
+        # 内容偏短的坏页（历史遗留缓存）必须被识别并重拉，不能把缺行当表尾
+        bad_path = client._rows_cache_path("ds", "cfg", "test", 700, data.PAGE_SIZE)
+        data._atomic_write_text(
+            bad_path, json.dumps({"rows": table[700:701], "num_rows_total": len(table)})
+        )
+        healed = client.rows("ds", "cfg", "test", 700, data.PAGE_SIZE)
+        checker.check(
+            "损坏的短页缓存被识别并重拉（不把缺行当成表尾）",
+            len(healed.get("rows") or []) == data.PAGE_SIZE,
+            f"{len(healed.get('rows') or [])} 行",
+        )
+
+        # 末页天然更短，不能被误判成坏页（否则每次读末页都要多拉一次）
+        tail = client.rows("ds", "cfg", "test", 950, 100)
+        checker.check(
+            "末页不足 length 时不被误判为坏页（不重复拉取）",
+            len(tail.get("rows") or []) == 50,
+            f"{len(tail.get('rows') or [])} 行",
+        )
+
+    # ---- 3) 每种语言的 34 / 33 / 33 片合并后必须恰好 1000 条 ----
+    ids_1000 = [str(index) for index in range(1000)]
+    per_split: dict[int, list[str]] = {}
+    for total in (34, 33, 33):
+        merged: list[str] = []
+        for index in range(total):
+            merged.extend(data.shard_query_ids(ids_1000, index, total))
+        per_split[total] = merged
+    checker.check(
+        "每种语言的 34 / 33 / 33 片合并后都恰好 1000 条 query（不重不漏）",
+        all(
+            len(shard_union) == 1000
+            and len(set(shard_union)) == 1000
+            and sorted(shard_union) == sorted(ids_1000)
+            for shard_union in per_split.values()
+        ),
+        "; ".join(f"{total} 片 → {len(union)} 条" for total, union in per_split.items()),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -889,6 +1028,7 @@ def run_selftest() -> int:
     _check_data_helpers(checker)
     _check_end_to_end(checker)
     _check_cli_and_robustness(checker)
+    _check_regressions(checker)
 
     print("\n=== 汇总 ===")
     print(f"通过 {checker.passes} 项，失败 {len(checker.failures)} 项")

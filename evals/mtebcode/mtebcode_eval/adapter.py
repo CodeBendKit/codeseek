@@ -5,7 +5,8 @@
 * 二进制：``rust-core/target/release/codeseek``（``cargo build --release`` 产物）。
 * ``codeseek init``：**没有目标目录参数**，必须在含 ``.git`` 的目录内执行，
   否则报 ``No project found. Run codeseek from within a git repository.``。
-* ``codeseek search <query> --json --limit <K>``：query 是位置参数，``cwd`` 必须是语料目录。
+* ``codeseek search --json --limit <K> -- <query>``：query 是位置参数，必须放在 ``--`` 之后
+  （以 ``-`` 开头的 query 否则会被 clap 当成未知 flag），``cwd`` 必须是语料目录。
 * 配置文件：``~/.codeseek/config.json``（**不是 toml**），``embedding`` 段字段为
   ``provider / model / api_token / api_base_url / dimensions / instruct``。
 * 检索有两条路径，报告里必须区分：
@@ -285,12 +286,20 @@ def search(
     limit: int = 20,
     timeout: float = 180.0,
 ) -> SearchOutcome:
-    """执行 ``codeseek search <query> --json --limit <K>`` 并返回结构化结果。
+    """执行 ``codeseek search --json --limit <K> -- <query>`` 并返回结构化结果。
 
     query 通过参数列表传入（**不用 shell=True**），因此 query 文本里的引号/换行/反引号
     都不会被杀掉或触发注入。
+
+    **选项必须排在 query 之前，且 query 必须放在 ``--`` 之后**：``query`` 是 clap 的
+    位置参数，若它落在选项区且以 ``-`` 开头（CodeSearchNet 里存在整行 ``-----`` 这类
+    查询），clap 会把它当成未知 flag 并以退出码 2 失败（实测报
+    ``error: unexpected argument '-----------------------------------' found``）。
+    ``--`` 是 clap 的转义分隔符，之后的所有值无条件按位置参数解释，因此无论 query
+    以多少个 ``-`` 开头都不会被误判。rust 侧同一子命令还额外设了
+    ``allow_hyphen_values``，两条防线互为备份（见 ``rust-core/src/cli/args.rs``）。
     """
-    argv = [str(binary), "search", query, "--json", "--limit", str(int(limit))]
+    argv = [str(binary), "search", "--json", "--limit", str(int(limit)), "--", query]
     started = time.monotonic()
     try:
         completed = subprocess.run(

@@ -228,6 +228,16 @@ pub enum Commands {
     /// Semantic code search (vector + BM25 + RRF fusion)
     Search {
         /// Search query text
+        ///
+        /// `allow_hyphen_values` 是**必需**的：query 是自然语言或代码片段，可能整行
+        /// 以 `-` 开头（评测数据里真实存在 `-----------------------------------` 这类
+        /// 分隔线查询）。没有它时 clap 会把这类值当未知 flag，直接以退出码 2 报
+        /// `unexpected argument '-----...' found`，一次检索都没发生。
+        ///
+        /// 调用方同时应把 query 放在 `--` 之后（`evals/mtebcode` 的 adapter 已这么做），
+        /// 两条防线互为备份：`--` 让 clap 无条件按位置参数解释，本属性保证即使
+        /// 调用方忘了 `--` 也不会误判。
+        #[clap(allow_hyphen_values = true)]
         query: String,
         /// Maximum results to return
         #[clap(short, long, default_value = "10")]
@@ -346,7 +356,11 @@ pub enum KnowledgeCommand {
     /// Search the knowledge base
     Search {
         /// Query text
-        #[arg(long)]
+        ///
+        /// `allow_hyphen_values`：与 `search` 子命令同理 —— 查询文本可能整段是
+        /// `-----`、`***` 这类符号（知识库里就是要搜这种片段），clap 默认会把它
+        /// 当成未知 flag 并以退出码 2 报 `unexpected argument`。
+        #[arg(long, allow_hyphen_values = true)]
         query: String,
         /// Max results
         #[arg(long, default_value_t = 8)]

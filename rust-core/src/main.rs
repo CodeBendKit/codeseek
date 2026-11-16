@@ -198,7 +198,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             storage.set_graph(pet_graph);
 
             // Phase 4: Embedding (90→100%) — only if API token configured
+            //
+            // ⚠ 这一步**真的会**为每个 code chunk 调远端 embedding 并把向量写进
+            // LanceDB，所以耗时与语料规模成正比：1000 文档 / 2000+ 函数的语料在
+            // 远端 API 正常时是**分钟级**，不可能是秒级。
+            //
+            // 历史实现在下面两条「不建向量」的路径上**完全静默**（配置加载失败 /
+            // token 为空）：init 只打印 `N files, M functions` 就以 0 退出，调用方
+            // 无法区分「向量已建好」与「只建了调用图 + BM25」。MTEB 全量评测里
+            // 「三个语料 init 各 ~2 秒 + 一半以上 query 返回 unknown_empty」正是
+            // 由此误导 —— hybrid 模式只按 JSON 结构判定，不代表 dense 通道可用。
+            // 现在两条跳过路径都给出明确 stderr 警告，收尾文案也会标注 WITHOUT embeddings。
             let mut embedding_done = false;
+            let embedding_skipped: Option<&'static str> = match config.as_ref() {
+                None => Some("Config::load 失败（没有可用的 codeseek 配置文件）"),
+                Some(cfg) if cfg.embedding.api_token.is_empty() => {
+                    Some("embedding.api_token 为空")
+                }
+                _ => None,
+            };
+            if let Some(reason) = embedding_skipped {
+                eprintln!(
+                    "[codeseek] warning: 已跳过向量索引构建（{reason}）。本次 init 只写了调用图与 BM25 索引：\
+                     `search` 的 dense 通道不可用，检索质量与评测分数都会失真。\
+                     请配置 embedding.api_token 后删除索引目录（或加 --force-reindex）重跑 init"
+                );
+            }
             if let Some(ref cfg) = config {
                 if !cfg.embedding.api_token.is_empty() {
                     pb.set_pct(90);
@@ -227,7 +252,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match EmbeddingService::new(&db_path, collection, Some(cfg), bm25_index).await {
                         Ok(es) => {
                             if let Err(e) = es.ensure_collection().await {
-                                warn!("Embedding table setup failed: {}", e);
+                                // 表都建不起来 ⇒ 后面一个向量也写不进去，必须让用户看见。
+                                eprintln!(
+                                    "[codeseek] warning: 向量索引未建 —— LanceDB 表初始化失败：{}",
+                                    e
+                                );
                                 embedding_done = false;
                             } else {
                                 // Load previous file hashes to detect deletions
@@ -259,14 +288,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Embedding not available (LanceDB issue): {}. Graph-based search will be used.", e);
+                                        eprintln!(
+                                            "[codeseek] warning: 向量索引未建 —— vectorize_directory 失败：{}。本次 init 只有调用图 + BM25 可用",
+                                            e
+                                        );
                                         embedding_done = false;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Embedding service unavailable: {}. Graph-based search will be used.", e);
+                            eprintln!(
+                                "[codeseek] warning: 向量索引未建 —— EmbeddingService 初始化失败：{}。本次 init 只有调用图 + BM25 可用",
+                                e
+                            );
                             embedding_done = false;
                         }
                     }
@@ -274,11 +309,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             pb.set_pct(100);
 
-            let suffix = if embedding_done { " + embeddings" } else { "" };
+            // 收尾文案必须能区分「向量建好了」与「只建了调用图 + BM25」：
+            // 否则 init 的成功输出会掩盖 dense 通道缺失（评测里表现为
+            // 「init 只花 2 秒」+「一半以上 query 空结果」）。
+            let suffix = if embedding_done {
+                " + embeddings"
+            } else {
+                " WITHOUT embeddings (dense channel unavailable)"
+            };
             pb.finish(&format!(
                 "{} files, {} functions{}",
                 stats.total_files, stats.total_functions, suffix
             ));
+            if !embedding_done && embedding_skipped.is_none() {
+                eprintln!(
+                    "[codeseek] warning: 向量索引未建立（embedding 阶段失败，原因见上方日志）——\
+                     索引里没有 dense 向量，`search` 只能走 BM25 / 图通道"
+                );
+            }
         }
         Commands::Status { json } => {
             let project_root = detect_project()?;

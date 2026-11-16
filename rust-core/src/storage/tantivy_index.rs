@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{Query, QueryParser};
 use tantivy::schema::{
     Field, FieldEntry, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
 };
@@ -584,17 +584,25 @@ impl TextSearchProvider for TantivyBm25Index {
             vec![self.content_field, self.symbol_name_field],
         );
 
-        // Sanitize query: wrap in quotes for exact phrase, catch parse errors
-        let parsed_query = query_parser.parse_query(query).unwrap_or_else(|_| {
-            let sanitized = query.replace(['"', '*', '?'], "");
-            if sanitized.contains(' ') {
-                query_parser
-                    .parse_query(&format!("\"{}\"", sanitized))
-                    .unwrap_or_else(|_| query_parser.parse_query(&sanitized).unwrap())
-            } else {
-                query_parser.parse_query(&sanitized).unwrap()
+        // 查询语法降级：QueryParser 把输入当 **lucene 查询语法**解析，而
+        // `search` 的入参是自然语言描述或代码片段 —— `-`/`+`/`:`/`(`/`~`/`^`
+        // 这些保留字符会让一整行 `-----`、`a && b`、`::new()` 解析失败。
+        // 历史实现在降级链末尾用 `unwrap()`，最后一级一旦失败就 **panic**
+        // （实测 `tantivy_index.rs:593`），进程以 101 退出 —— 对 `--json`
+        // 消费者来说等价于「stderr 有 panic、stdout 没有任何输出」。
+        //
+        // 现在：逐级降级，全部失败则 eprintln 警告 + 返回空结果。
+        // 绝不 panic，也绝不静默（stderr 告警与 main.rs 的 `search_degraded` 风格一致）。
+        let parsed_query = match build_tantivy_query(&query_parser, query) {
+            Some(parsed) => parsed,
+            None => {
+                eprintln!(
+                    "[codeseek] warning: BM25 查询无法解析为 tantivy query（已尝试去保留字符与逐词降级）：{:?}；本次稀疏通道返回空结果",
+                    shorten_for_log(query)
+                );
+                return Ok(Vec::new());
             }
-        });
+        };
 
         let top_docs = searcher
             .search(&parsed_query, &TopDocs::with_limit(limit.max(1)))
@@ -675,6 +683,88 @@ impl TextSearchProvider for TantivyBm25Index {
         let searcher = reader.searcher();
         Ok(searcher.num_docs() as usize)
     }
+}
+
+// ─────────────────────────────────────────────
+// Query 语法降级（输入是自然语言/代码片段，不是 lucene 查询语法）
+// ─────────────────────────────────────────────
+
+/// lucene / tantivy 查询语法里的**保留字符**。
+///
+/// 它们对 `QueryParser` 有语义（前缀 `-` = NOT、`+` = MUST、`*`/`?` = 通配、
+/// `"` = 短语、`^` = boost …），但对「把用户输入整段当查询」来说只是噪声：
+/// 一整行 `-----`、`a && b`、`::new()` 都会让解析器报语法错误。
+const LUCENE_RESERVED: &[char] = &[
+    '+', '-', '&', '|', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/',
+];
+
+/// 把保留字符替换成空格并压缩空白，得到「纯词面」文本。
+fn sanitize_lucene_query(text: &str) -> String {
+    text.chars()
+        .map(|ch| if LUCENE_RESERVED.contains(&ch) { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 把任意用户输入**逐级降级**成 tantivy `Query`；全部失败返回 `None`。
+///
+/// 降级顺序（越靠前越保真）：
+/// 1. 原文 —— 本来就是合法查询语法时完全保持原语义，不做任何改写；
+/// 2. 去掉保留字符后的整段；
+/// 3. 同上但包成引号短语（自然语言描述的检索语义更贴近 phrase match）；
+/// 4. 只保留含字母/数字的词，用 `OR` 连接 —— 彻底绕开语法。
+///
+/// 返回 `None` 的两种情况：输入为空，或输入**不含任何可检索的词**
+/// （例如整行 `-----`、`===`、`...`）。调用方据此降级为空结果 + stderr 警告，
+/// 而不是构造一个必然语法错误、随后 `unwrap()` panic 的查询。
+///
+/// `pub(crate)`：`knowledge::tantivy` 的 BM25 检索有**完全相同**的
+/// `parse_query(...).unwrap()` 历史缺陷，两处共用这一条降级链，避免各写一份
+/// 而只修了一处。
+pub(crate) fn build_tantivy_query(parser: &QueryParser, raw: &str) -> Option<Box<dyn Query>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<String> = vec![trimmed.to_string()];
+    let stripped = sanitize_lucene_query(trimmed);
+    if !stripped.is_empty() && stripped != trimmed {
+        candidates.push(stripped.clone());
+        candidates.push(format!("\"{}\"", stripped));
+    }
+
+    let words: Vec<String> = stripped
+        .split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_alphanumeric()))
+        .map(|word| word.to_string())
+        .collect();
+    if words.is_empty() {
+        // 一个可检索的词都没有：查了也是白查，直接交给调用方降级。
+        return None;
+    }
+    if words.len() > 1 {
+        candidates.push(words.join(" OR "));
+    }
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| parser.parse_query(&candidate).ok())
+}
+
+/// 截断日志里的查询文本（避免把整行评测数据刷进 stderr）。
+pub(crate) fn shorten_for_log(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let mut out: String = cleaned.chars().take(120).collect();
+    if cleaned.chars().count() > 120 {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -875,5 +965,81 @@ mod tests {
         );
         assert_eq!(results[0].file_path, "/tmp/a.rs");
         assert_eq!(results[0].symbol_name, "foo");
+    }
+
+    /// 回归：病态查询必须降级为「空结果」，**绝不能 panic**。
+    ///
+    /// 历史实现在 `search()` 的语法降级链末尾用 `unwrap()`：输入整行都是
+    /// lucene 保留字符时（`-----...`、`***`、`(((`），最后一级仍解析失败 →
+    /// `unwrap()` panic，进程以 101 退出（实测 `tantivy_index.rs:593`）。
+    /// 对 `--json` 消费者来说这等于「没有任何输出」，评测侧只能记成 unknown_empty。
+    #[tokio::test]
+    async fn pathological_queries_degrade_to_empty_without_panic() {
+        let dir = tempdir().unwrap();
+        let index = TantivyBm25Index::open_or_create(dir.path()).unwrap();
+
+        index
+            .index_chunks(vec![CodeChunk::new(
+                "/tmp/a.py",
+                "def add_numbers(a, b):\n    return a + b\n",
+                "add_numbers",
+                "function",
+                "python",
+                1,
+                2,
+            )])
+            .await
+            .unwrap();
+        index.commit().await.unwrap();
+
+        // 全部由保留字符组成 / 含未闭合语法 / 含控制字符的查询
+        let hostile = [
+            "-----------------------------------",
+            "=====",
+            "***",
+            "(((",
+            "\"\"\"",
+            "a && b",
+            "::new()",
+            "\\\\",
+            "a[b]{c}",
+            "\u{0}",
+            "~~~ ^^",
+        ];
+        for query in hostile {
+            let outcome = index.search(query, 10).await;
+            assert!(
+                outcome.is_ok(),
+                "病态查询 {:?} 必须降级为 Ok（不能 panic / 不能返回 Err）：{:?}",
+                query,
+                outcome.err()
+            );
+        }
+
+        // 降级不能把正常查询一起废掉：命中仍须存在
+        let hits = index.search("add_numbers", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "正常查询必须仍能命中");
+        assert_eq!(hits[0].symbol_name, "add_numbers");
+    }
+
+    /// `build_tantivy_query` 的降级顺序：整段保留字符 → None（不构造必然报错的查询）。
+    #[test]
+    fn build_query_returns_none_when_nothing_is_searchable() {
+        let dir = tempdir().unwrap();
+        let index = TantivyBm25Index::open_or_create(dir.path()).unwrap();
+        let parser = QueryParser::for_index(&index.index, vec![index.content_field]);
+
+        assert!(
+            build_tantivy_query(&parser, "-----------------------------------").is_none(),
+            "整行分隔线没有任何可检索的词，应返回 None 交给调用方降级"
+        );
+        assert!(
+            build_tantivy_query(&parser, "   ").is_none(),
+            "空白查询应返回 None"
+        );
+        assert!(
+            build_tantivy_query(&parser, "add_numbers").is_some(),
+            "普通标识符必须能构造出查询"
+        );
     }
 }

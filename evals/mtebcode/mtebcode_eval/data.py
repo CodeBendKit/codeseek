@@ -652,8 +652,27 @@ class DatasetClient:
     def _cache_base(self, dataset: str) -> Path:
         return self.cache_root / dataset.replace("/", "__")
 
-    def _rows_cache_path(self, dataset: str, config: str, split: str, offset: int) -> Path:
-        return self._cache_base(dataset) / _safe_segment(config) / _safe_segment(split) / f"{int(offset)}.json"
+    def _rows_cache_path(
+        self, dataset: str, config: str, split: str, offset: int, length: int = PAGE_SIZE
+    ) -> Path:
+        """``/rows`` 的磁盘缓存路径。
+
+        **``length`` 必须进文件名。** 历史实现只按 ``offset`` 命名，而
+        :func:`probe_id_scheme` 会用 ``length=1`` 探测 ``{0, num_rows//2, num_rows-1}``：
+        探测把 ``offset=num_rows//2`` 写成了「只含 1 行」的缓存，随后 :func:`iter_rows`
+        请求同一 ``offset`` 的整页（``length=PAGE_SIZE``）时命中它，拿到 1 行就
+        ``offset += PAGE_SIZE``，中间 99 行被整段跳过。
+
+        实测后果：``mteb/CodeSearchNetRetrieval`` 的 go/java/python 三个 qrels 表各
+        1000 行，``num_rows//2 == 500``，于是三语言都以**完全相同**的区间丢掉
+        ``501..599``，每语言只剩 901 条 query（2703 题而非 3000 题）。
+        """
+        return (
+            self._cache_base(dataset)
+            / _safe_segment(config)
+            / _safe_segment(split)
+            / f"{int(offset)}_{int(length)}.json"
+        )
 
     def _meta_cache_path(self, dataset: str, name: str) -> Path:
         return self._cache_base(dataset) / f"_{name}.json"
@@ -794,7 +813,7 @@ class DatasetClient:
             payload = self.parquet.rows(dataset, config, split, offset, length)
             self.stats.parquet_pages += 1
             return payload
-        path = self._rows_cache_path(dataset, config, split, offset)
+        path = self._rows_cache_path(dataset, config, split, offset, length)
 
         def _fetch() -> dict[str, Any]:
             return self._fetch_json(
@@ -802,12 +821,32 @@ class DatasetClient:
                 {"dataset": dataset, "config": config, "split": split, "offset": offset, "length": int(length)},
             )
 
-        payload = self._cached_json(path, _fetch, f"{dataset} {config}/{split} @{offset}")
-        rows = payload.get("rows")
-        if not isinstance(rows, list):
-            raise DatasetError(
-                f"{dataset} {config}/{split} @{offset}: /rows 返回结构异常：{str(payload)[:300]}"
-            )
+        def _validated(payload: dict[str, Any]) -> dict[str, Any]:
+            rows = payload.get("rows")
+            if not isinstance(rows, list):
+                raise DatasetError(
+                    f"{dataset} {config}/{split} @{offset}: /rows 返回结构异常：{str(payload)[:300]}"
+                )
+            return payload
+
+        payload = _validated(
+            self._cached_json(path, _fetch, f"{dataset} {config}/{split} @{offset}+{int(length)}")
+        )
+        if _page_short_of_request(payload, offset, int(length)):
+            # 缓存页比请求短且不属于「末页」→ 是被更短请求（probe 的 length=1）
+            # 或更早版本（缓存名不含 length）污染的坏页。删掉重拉一次，
+            # 绝不把缺行当成「表就这么多行」交给上层（那会静默丢评测题）。
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            payload = _validated(_fetch())
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
+            if not self.quiet:
+                _log(
+                    f"[data] 缓存页行数不足，已重新拉取并覆盖："
+                    f"{dataset} {config}/{split} @{offset}+{int(length)}"
+                )
         return payload
 
     def num_rows(self, dataset: str, config: str, split: str) -> int:
@@ -837,6 +876,25 @@ def _read_error_body(exc: urllib.error.HTTPError, limit: int = 300) -> str:
 def _safe_segment(value: str) -> str:
     """把 config/split 名安全化成单层目录名。"""
     return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "_"
+
+
+def _page_short_of_request(payload: dict[str, Any], offset: int, length: int) -> bool:
+    """判断一页是否「比请求短且不可能是末页」——即被污染的坏缓存。
+
+    末页天然比 ``length`` 短（``offset + 实得行数 == num_rows_total``），不算坏页；
+    只有当「请求区间整体落在表内」（``offset + length <= num_rows_total``）却拿到
+    更少的行时，才说明这页缓存的内容属于一次更短的请求。
+
+    无法读到 ``num_rows_total`` 时保守判为坏页：宁可多拉一次，也不能静默丢行。
+    """
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or len(rows) >= length:
+        return False
+    try:
+        total = int(payload.get("num_rows_total"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return True
+    return offset + length <= total
 
 
 # ---------------------------------------------------------------------------
