@@ -190,6 +190,29 @@ codeseek uninstall
 
 无守护进程、无 HTTP 服务器。每个命令都是独立的单次进程。
 
+## 评测结果
+
+在公开代码检索基准上的端到端实测成绩，全部数字均由 [`evals/`](evals/) 下的评测套件跑出——实测，非估算。
+
+| 基准 | 测什么 | 规模 | 指标 | 成绩 |
+|------|--------|------|------|:----:|
+| **[MTEB(Code, v1)](evals/mtebcode/)** | 自然语言 → 函数检索（go / java / python 真实源码）+ CosQA | 101 任务 · 3,040 条查询 | nDCG@10 | **0.9182** |
+| **[RepoQA](evals/repoqa/)** | 真实仓库内的代码定位（大海捞针） | 10 仓库 · 5 语言 · 100 任务 | accuracy | **84.0%** |
+
+**MTEB(Code)** —— go `0.9448` · java `0.9101` · python `0.8994` · CosQA `0.9598`；recall@10 `0.9720`、
+MRR@10 `0.9004`。目标函数几乎总能被召回，剩余差距在首位排序，而非候选生成。
+
+**RepoQA** —— typescript `100%` · python `90%` · rust `90%` · java `85%` · cpp `55%`。
+
+```bash
+# 完整复现命令见 evals/*/results/README.md
+cd evals/mtebcode && python3 -m mtebcode_eval prepare --tasks csn,CosQA
+cd evals/repoqa   && python3 -m repoqa_eval prepare
+```
+
+> 测试条件：codeseek v0.1.31 + `Qwen/Qwen3-Embedding-4B`，`index.hybrid.cutoff.enabled = false`。
+> 完整报告：[`evals/mtebcode/results/`](evals/mtebcode/results/)、[`evals/repoqa/results/`](evals/repoqa/results/)。
+
 ## 支持的语言
 
 | 语言 | 函数 | 结构体/类 | 调用图 |

@@ -129,16 +129,24 @@ impl KnowledgeTantivyIndex {
             vec![self.title_field, self.content_field],
         );
 
-        let parsed_query = query_parser.parse_query(query).unwrap_or_else(|_| {
-            let sanitized = query.replace(['"', '*', '?'], "");
-            if sanitized.contains(' ') {
-                query_parser
-                    .parse_query(&format!("\"{}\"", sanitized))
-                    .unwrap_or_else(|_| query_parser.parse_query(&sanitized).unwrap())
-            } else {
-                query_parser.parse_query(&sanitized).unwrap()
-            }
-        });
+        // 与 `storage::tantivy_index::search` 共用同一条语法降级链。
+        //
+        // QueryParser 把入参当 **lucene 查询语法**，而 `knowledge search` 的入参是
+        // 用户写的自然语言/关键符号：`-----`、`a && b`、`::new()` 都会让解析失败。
+        // 历史实现（这里与 storage 那处逐字相同）在降级链末尾用 `unwrap()`，最后
+        // 一级失败就 **panic**，整个进程以 101 退出。现在统一降级为空结果 + stderr
+        // 警告，绝不 panic、也不静默。
+        let parsed_query =
+            match crate::storage::tantivy_index::build_tantivy_query(&query_parser, query) {
+                Some(parsed) => parsed,
+                None => {
+                    eprintln!(
+                        "[codeseek] warning: knowledge BM25 查询无法解析为 tantivy query（已尝试去保留字符与逐词降级）：{:?}；本次返回空结果",
+                        crate::storage::tantivy_index::shorten_for_log(query)
+                    );
+                    return Ok(Vec::new());
+                }
+            };
 
         let final_query: Box<dyn tantivy::query::Query> = if domains.is_empty() {
             parsed_query

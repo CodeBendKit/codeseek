@@ -1,0 +1,9 @@
+# Python 运行产物（本套件不产生其他构建物）
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# results/ 只归档最终 report；临时文件不入库
+results/*.tmp
+results/*.json.tmp

@@ -477,7 +477,13 @@ const PER_CASE_BASELINE: &[(&str, Metrics, usize)] = &[
     //   ambiguous_trait_impl 的 5 个同名 `run` 候选被压成 2 条边
     ("ambiguous_trait_impl", Metrics { function_nodes: 7, edges: 2, resolved: 2, unresolved: 0, cross_file_edges: 0, ambiguous_call_sites: 2, ghost_nodes: 0 }, 5),
     // ---- 4 个整仓小项目（tests/test_repos/）----
-    ("simple_rust_project", Metrics { function_nodes: 46, edges: 44, resolved: 34, unresolved: 10, cross_file_edges: 6, ambiguous_call_sites: 0, ghost_nodes: 10 }, 1),
+    //   simple_rust_project：`function_nodes` 46→48、`cross_file_edges` 6→7（parser 修复）。
+    //   `src/lib.rs` 的 `#[cfg(test)] mod tests {..}` 内两个 `#[test] fn` 此前从未被索引
+    //   （rust `parse_block` 缺 `mod_item` 分支 ⇒ 整个 mod 子树零产出），补上后成为真实函数
+    //   节点；它们对 `public_function()` / `complex_calculation()` 的调用另多出 1 条跨文件边。
+    //   `edges` / `resolved` / `unresolved` / `ambiguous_call_sites` / `ghost_nodes` 五项
+    //   **均未变化** ⇒ 本次只是补回漏掉的符号，未引入任何误连或退化。
+    ("simple_rust_project", Metrics { function_nodes: 48, edges: 44, resolved: 34, unresolved: 10, cross_file_edges: 7, ambiguous_call_sites: 0, ghost_nodes: 10 }, 1),
     ("simple_python_project", Metrics { function_nodes: 45, edges: 48, resolved: 32, unresolved: 16, cross_file_edges: 10, ambiguous_call_sites: 0, ghost_nodes: 16 }, 0),
     ("simple_ts_project", Metrics { function_nodes: 92, edges: 101, resolved: 70, unresolved: 31, cross_file_edges: 8, ambiguous_call_sites: 4, ghost_nodes: 31 }, 1),
     ("simple_js_project", Metrics { function_nodes: 1577, edges: 746, resolved: 546, unresolved: 200, cross_file_edges: 31, ambiguous_call_sites: 187, ghost_nodes: 200 }, 3),

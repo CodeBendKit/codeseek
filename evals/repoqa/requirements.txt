@@ -1,0 +1,13 @@
+# The only hard dependency of the RepoQA evaluation suite.
+# BLEU needs nltk's sentence_bleu + SmoothingFunction().method4 to match the official
+# reference implementation digit for digit; if nltk is not installed, repoqa_eval.bleu
+# automatically falls back to a built-in method4 reimplementation (selftest still passes offline).
+nltk>=3.8,<4
+
+# --- Optional dependencies (everything runs without them; they only affect the
+# "extract the first function definition" step performed before scoring) ---
+# tree-sitter / tree-sitter-language-pack: the official sanitize_output uses them to
+# extract the first function definition from a code block. When absent, this suite uses
+# the whole code block instead and mentions it in selftest.
+# tree-sitter>=0.21
+# tree-sitter-language-pack>=0.1

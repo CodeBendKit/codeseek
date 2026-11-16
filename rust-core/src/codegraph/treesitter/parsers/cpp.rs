@@ -98,6 +98,39 @@ pub fn parse_type(parent: &Node, code: &str) -> Option<TypeDef> {
     None
 }
 
+/// 把一个 `name` 字段节点拆成 **裸名** 与 **scope 文本**。
+///
+/// `tree-sitter-cpp` 把 `A::B::C` 解析成嵌套的 `qualified_identifier`
+/// （`scope` = 前一节、`name` = 最后一节）。符号名写进 `ast_fields.name` 时必须是
+/// 最后一节的裸名，前缀一律进 `ast_fields.namespace` —— 否则容器的 `symbol_name`
+/// 会**逐字包含**成员全名（`struct Outer::Inner` → `"Outer::Inner"` 里含 `"Inner"`），
+/// 任何以成员名为意图的检索都会命中容器，而容器 chunk 的内容是整段 struct。
+///
+/// **不变式：任何符号的 `name` 都不得包含 `::`。**
+fn split_qualified_name<'a>(name: &Node<'a>, code: &str) -> (String, String) {
+    if name.kind() != "qualified_identifier" {
+        return (code.slice(name.byte_range()).to_string(), String::new());
+    }
+    let scope = name
+        .child_by_field_name("scope")
+        .map(|n| code.slice(n.byte_range()).to_string())
+        .unwrap_or_default();
+    let bare = name
+        .child_by_field_name("name")
+        .map(|n| code.slice(n.byte_range()).to_string())
+        // 防御：语法树异常（或缺 name 字段）时退化为纯文本取最后一节，
+        // 任何情况下都不把带 `::` 的文本当作符号名写出去。
+        .unwrap_or_else(|| {
+            code.slice(name.byte_range())
+                .rsplit("::")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        });
+    (bare, scope)
+}
+
 impl CppParser {
     pub fn new() -> Result<CppParser, ParserError> {
         let mut parser = Parser::new();
@@ -140,7 +173,16 @@ impl CppParser {
         }
 
         if let Some(name) = info.node.child_by_field_name("name") {
-            decl.ast_fields.name = code.slice(name.byte_range()).to_string();
+            // 修复（RepoQA cpp 短板）：名字只取裸名，scope 进 namespace。
+            // 真实案例 `throwableinformationpatternconverter.cpp:30`
+            //   `struct ThrowableInformationPatternConverter::ThrowableInformationPatternConverterPrivate`
+            // 的 name 字段是 qualified_identifier，改前整段写成符号名 → 容器的
+            // symbol_name 逐字包含成员（3 行构造器）的名字，检索必然先命中 12 行的容器。
+            let (bare_name, scope_name) = split_qualified_name(&name, code);
+            decl.ast_fields.name = bare_name;
+            if !scope_name.is_empty() {
+                decl.ast_fields.namespace = scope_name;
+            }
             decl.ast_fields.declaration_range = Range {
                 start_byte: decl.ast_fields.full_range.start_byte,
                 end_byte: name.end_byte(),

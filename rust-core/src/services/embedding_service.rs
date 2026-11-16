@@ -615,6 +615,13 @@ impl EmbeddingService {
 
         // Parse with TreeSitter
         let symbols = ts_parser.parse_file(&file_path.to_path_buf())?;
+        // ── 索引口径与范围判定（只有一份：`chunker::select_effective_ranges`）──
+        // 内容降级已停用：所有符号（含把成员整块吞进去的容器 struct/class）的 content 与
+        // 行号一律取自 `full_range`，父子包含关系改由排序期无损降权
+        // （`hybrid_search::demote_enclosing_candidates`）。
+        let effective_ranges = crate::codegraph::chunker::select_effective_ranges(&symbols);
+        // 一次性读取文件内容：content 与行号必须切自同一个有效范围（不再每个符号读一次盘）。
+        let file_content = fs::read_to_string(file_path).ok();
         
         let mut vectors_created = 0;
         let mut points = Vec::new();
@@ -623,36 +630,49 @@ impl EmbeddingService {
         let mut cache_miss_queue: Vec<(String, String, String, String, String, usize, usize, String)> = Vec::new();
         const BATCH_SIZE: usize = 20;
         
-        for symbol in symbols {
+        for (symbol_idx, symbol) in symbols.iter().enumerate() {
+            // 非候选（类型不在索引口径内）直接跳过：类型口径与范围判定都只有一份，
+            // 由 `chunker::select_effective_ranges` 统一给出。
+            let effective = match effective_ranges.get(symbol_idx).and_then(|entry| entry.as_ref()) {
+                Some(effective) => effective,
+                None => continue,
+            };
+
             // Extract data and drop guard immediately
             let extracted = {
                 let symbol_guard = symbol.read();
                 let symbol_ref = symbol_guard.as_ref();
-                
-                match symbol_ref.symbol_type() {
-                    crate::codegraph::treesitter::structs::SymbolType::StructDeclaration |
-                    crate::codegraph::treesitter::structs::SymbolType::FunctionDeclaration => {
+
+                // content 与 line_start/line_end 必须来自 effective 的**同一个**范围；
+                // 文件不可读时回退到原来的逐符号读取（行为与改前一致）
+                let (code_block, line_start, line_end) = match file_content
+                    .as_deref()
+                    .and_then(|content| effective.content_and_lines(content))
+                {
+                    Some(fields) => fields,
+                    None => {
                         let symbol_info = symbol_ref.symbol_info_struct();
                         let code_block = symbol_info.get_content_from_file_blocked()
                             .unwrap_or_else(|e| {
                                 eprintln!("Warning: Failed to get content for {}: {}", symbol_ref.name(), e);
                                 symbol_ref.name().to_string()
                             });
-                        
-                        Some((
-                            code_block,
-                            symbol_ref.name().to_string(),
-                            format!("{:?}", symbol_ref.symbol_type()),
-                            format!("{:?}", symbol_ref.language()),
-                            symbol_ref.full_range().start_point.row,
-                            symbol_ref.full_range().end_point.row,
-                        ))
+                        let full_range = symbol_ref.full_range();
+                        (code_block, full_range.start_point.row + 1, full_range.end_point.row + 1)
                     }
-                    _ => None,
-                }
+                };
+
+                Some((
+                    code_block,
+                    symbol_ref.name().to_string(),
+                    format!("{:?}", symbol_ref.symbol_type()),
+                    format!("{:?}", symbol_ref.language()),
+                    line_start,
+                    line_end,
+                ))
             };
 
-            if let Some((code_block, name, symbol_type_str, language_str, start_row, end_row)) = extracted {
+            if let Some((code_block, name, symbol_type_str, language_str, line_start, line_end)) = extracted {
                 // ── 通道分层：先判 BM25（稀疏），再判 dense（向量）──
                 //
                 // 两个通道的质量判据不同，必须分开处理，不能用同一把尺子：
@@ -669,8 +689,8 @@ impl EmbeddingService {
                         name.clone(),
                         symbol_type_str.clone(),
                         language_str.clone(),
-                        start_row + 1,
-                        end_row + 1,
+                        line_start,
+                        line_end,
                     );
                     bm25_chunks.push(chunk);
                 }
@@ -706,7 +726,7 @@ impl EmbeddingService {
                     cache_miss_queue.push((
                         hash, code_block.clone(), name.clone(),
                         symbol_type_str.clone(), language_str.clone(),
-                        start_row + 1, end_row + 1,
+                        line_start, line_end,
                         file_path.to_string_lossy().into_owned(),
                     ));
                     continue; // skip CodePoint creation — handled after batch
@@ -720,8 +740,8 @@ impl EmbeddingService {
                     symbol_name: name,
                     symbol_type: symbol_type_str,
                     language: language_str,
-                    line_start: (start_row + 1) as i64,
-                    line_end: (end_row + 1) as i64,
+                    line_start: line_start as i64,
+                    line_end: line_end as i64,
                     code_block,
                 };
                 

@@ -128,6 +128,19 @@ impl RustParser {
     }
 
     pub fn parse_function_declaration(&mut self, parent: &Node, code: &str, path: &PathBuf, parent_guid: &Uuid, is_error: bool) -> Vec<AstSymbolInstanceArc> {
+        // ⚠ 这里**故意不**跳过"嵌套内层 fn"（`fn outer() { fn inner() {} }`）。
+        //
+        // 曾实现过"只登记最外层 function_item"，实测代价是两处既有能力回归：
+        // 1. `resolution::ScopeBuilder` 靠这些符号建 ScopeTree，
+        //    `nested_function_caller` 场景的 `innermost_scope_containing(12)` 会丢掉 `inner`，
+        //    P2a 的"caller 归属按最内层作用域"判定退化（tests/test_resolution_engine.rs）。
+        // 2. `emit_legacy_call_edges_for_file` / FunctionInfo 落节点依赖本符号，
+        //    `outer` 里 `inner(x)` 这条边会从 resolved 退化成 ghost
+        //    （tests/test_p1_edges_unchanged.rs / test_p2b_wiring.rs）。
+        //
+        // 而"内层 fn 抢占外层 fn 的检索结果"这件事的正确修法在 **chunk 层**
+        // （容器/被包含者做父子剪枝，见 `chunker::extract_chunks`），
+        // 不能在 parser 层删符号 —— 删符号会同时删掉调用图与作用域信息。
         let mut symbols: Vec<AstSymbolInstanceArc> = Default::default();
         let mut decl = FunctionDeclaration::default();
         decl.ast_fields.language = LanguageId::Rust;
@@ -202,6 +215,13 @@ impl RustParser {
     }
 
     pub fn parse_struct_declaration(&mut self, parent: &Node, code: &str, path: &PathBuf, parent_guid: &Uuid, is_error: bool) -> Vec<AstSymbolInstanceArc> {
+        // 修复 3（方案 A 的修订版）：`impl ... { ... }` 不再产出"巨型容器 chunk"。
+        // 不改结构体字段、不删符号、**不改 name** —— 只把 `full_range` 收窄到声明行。
+        // 改前 `impl Parser<I> for LengthCount { ..1524 chars.. }` 产出
+        // name=`LengthCount`、L1525-L1579（1524 字符）的 chunk，其 full_range 严格包含
+        // 该 impl 内所有 method chunk（`length_count` 本身只有 322 字符，却要在内容
+        // 相似度上输给一个 1524 字符、把方法体全吞进去的容器）。
+        let is_impl = parent.kind() == "impl_item";
         let mut symbols: Vec<AstSymbolInstanceArc> = Default::default();
         let mut decl = StructDeclaration::default();
 
@@ -285,6 +305,21 @@ impl RustParser {
                 &_ => {}
             }
             decl.ast_fields.definition_range = body_node.range();
+        }
+        // 方案 A 的收窄：此时 `declaration_range` 已由 `type`（或 `name`）字段确定为
+        // `impl Parser<I> for LengthCount` 这一行（不含 body），把它当成新的 `full_range`，
+        // 使 impl 容器 chunk 不再覆盖其成员方法的源码区间。
+        // 防御：只在 `declaration_range` 确实更短时收窄 —— 若 impl 没有 `type` 字段
+        // （语法树异常），declaration_range 仍是整块范围，此时保持原样而不是退化成空区间。
+        //
+        // ⚠ **name 必须保持裸类型名，不能加 `impl ` 前缀**：`resolution::ScopeBuilder` 把
+        // `StructDeclaration` 建成 `ScopeKind::Type` 作用域，`ScopeTree::enclosing_type_name`
+        // 沿 parent_guid 链读的正是这个 `name`；一旦写成 `impl Calc`，
+        // `FunctionTag.enclosing_type` 就变成 `impl Calc`，L2 `EnclosingTypeMember` /
+        // L3 `ReceiverTypeMember` 按类型名匹配全部落空
+        // （实测 `method_receiver` 场景从 L3-ReceiverType 退化为 L7-GlobalUnique）。
+        if is_impl && decl.ast_fields.declaration_range.end_byte < decl.ast_fields.full_range.end_byte {
+            decl.ast_fields.full_range = decl.ast_fields.declaration_range;
         }
         decl.ast_fields.childs_guid = get_children_guids(&decl.ast_fields.guid, &symbols);
         symbols.push(Arc::new(RwLock::new(Box::new(decl))));
@@ -990,6 +1025,21 @@ impl RustParser {
                 }
                 "enum_item" | "struct_item" | "trait_item" | "impl_item" | "union_item" => {
                     symbols.extend(self.parse_struct_declaration(&child, code, path, parent_guid, is_error));
+                }
+                // 修复（RepoQA rust 短板 1）：`mod_item` 此前没有分支，落到 `_ =>` 走
+                // `parse_usages`，而 `parse_usages` 的兜底分支 `_ => {}` **不递归** →
+                // 整个 `#[cfg(test)] mod tests { ... }` 子树零产出（实测
+                // rust-bakery/nom/src/str.rs 改前产出 0 个符号）。
+                // 三种变体 kind 都是 `mod_item`：`mod tests {..}`、`pub mod foo {..}`
+                // （`pub` 是 visibility_modifier 子节点）、`#[cfg(feature = "x")] mod bar {..}`
+                // （`#[cfg(..)]` 是前置 attribute_item 兄弟节点），都不妨碍进入本分支。
+                // `mod foo;`（仅声明、无 body）时 child_by_field_name("body") 为 None，安全跳过。
+                // 递归终止性：tree-sitter AST 是有限树且 body 严格小于父节点，
+                // 嵌套 `mod a { mod b { .. } }` 只是逐层下降，不会无限递归。
+                "mod_item" => {
+                    if let Some(body) = child.child_by_field_name("body") {
+                        symbols.extend(self.parse_block(&body, code, path, parent_guid, is_error));
+                    }
                 }
                 "function_item" | "function_signature_item" => {
                     symbols.extend(self.parse_function_declaration(&child, code, path, parent_guid, is_error));

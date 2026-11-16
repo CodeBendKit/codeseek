@@ -301,7 +301,11 @@ const LEGACY_BASELINE: &[(&str, [usize; 6])] = &[
     ("method_receiver", [4, 1, 1, 0, 1, 0]),
     ("nested_function_caller", [5, 3, 2, 1, 0, 1]),
     ("ambiguous_trait_impl", [7, 2, 2, 0, 2, 0]),
-    ("simple_rust_project", [46, 44, 34, 10, 0, 10]),
+    // ⚠ `simple_rust_project` 函数节点 46→48：`src/lib.rs` 的 `#[cfg(test)] mod tests { .. }`
+    // 里两个 `#[test] fn` 此前**零产出**（rust `parse_block` 缺 `mod_item` 分支 → 整棵
+    // 子树不被遍历，属于"符号不存在"而非"排不上"）。补上 `mod_item` 遍历后它们成为真实
+    // 函数节点。同表其余四项 44/34/10/10 一字未变 ⇒ 只是补回漏掉的符号，没有新增误连。
+    ("simple_rust_project", [48, 44, 34, 10, 0, 10]),
     ("simple_python_project", [45, 48, 32, 16, 0, 16]),
     ("simple_ts_project", [92, 101, 70, 31, 4, 31]),
     ("simple_js_project", [1577, 746, 546, 200, 187, 200]),

@@ -1,0 +1,15 @@
+"""
+No third-party dependencies required.
+
+This evaluation suite is **pure Python standard library** (Python >= 3.10):
+
+* data access  -> urllib.request (HuggingFace datasets-server JSON REST API)
+* metrics      -> math (nDCG@k / recall@k / MRR@k / precision@k, no numpy)
+* concurrency  -> concurrent.futures.ThreadPoolExecutor
+* process calls-> subprocess (codeseek init / codeseek search)
+
+Do NOT add datasets / huggingface_hub / pyarrow / numpy: the whole point of using the
+datasets-server REST API is that `pip install` is never needed (see README.md section 4).
+
+Only the codeseek binary itself is required for `run` (not for `prepare` / `score` / `selftest`).
+"""
