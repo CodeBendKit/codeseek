@@ -87,7 +87,6 @@ python3 -m mtebcode_eval prepare \
   --workdir /tmp/mtebcode-csn \
   --tasks csn \
   --seed 42 \
-  --parquet-cache ~/.cache/huggingface/hub \
   --proxy http://127.0.0.1:7897
 
 # 2. run: serial init (3 corpora) + concurrent search (3,000 queries) + scoring + report

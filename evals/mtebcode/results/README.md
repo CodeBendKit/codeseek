@@ -18,14 +18,17 @@ CosQA, over 3 shared per-language corpora of 1,000 real source files each and on
 
 **Provenance**: `2026-11-16-report.md` is produced by `render_markdown()` in `mtebcode_eval/report.py` from
 `2026-11-16-report.json`; **no number was edited by hand**, and `md == render_markdown(json)` was verified
-**byte for byte** (`True`, 35,717 characters on both sides). Measured values of the archived files:
+**byte for byte** (`True`, 35,499 characters on both sides). Measured values of the archived files:
 
 | file | bytes | md5 |
 | --- | --- | --- |
-| `2026-11-16-report.md` | 35823 | `86a7bacee240b38f8d03892b9453c8f9` |
+| `2026-11-16-report.md` | 35606 | `1a2962cb9ff6a03c709eb3c0f76f402e` |
 | `2026-11-16-report.json` | 6030638 | `b22dfdc37ba248f1b7b8bd2c8d4f0e5d` |
 
 The `.json` file was **never rewritten** after the run: only the `.md` was rendered from that same `.json`.
+The `.md` was re-rendered once more after `_reproduction_commands()` dropped the `--parquet-cache` line
+(it only ever served the retired `CodeEditSearchRetrieval-typescript` task, whose `/rows` answered HTTP 500),
+which is why its recorded bytes/md5 differ from the first render; the `.json` is byte-identical to the run output.
 Every statistic below is read from the `.json`.
 
 **Batch**: 2026-11-16 — 101 tasks, 3040 queries, 3300 documents indexed, `index.hybrid.cutoff.enabled = false`,
