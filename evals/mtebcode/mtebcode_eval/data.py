@@ -40,7 +40,7 @@
 （实测 cosqa 的 offset 0 → ``d1, d2, d3``，即 ``id = prefix + (行号 + 1)``；
 CodeSearchNet python 的 offset 1000 → ``c1000``，即 ``id = prefix + 行号``），
 所以先探测 2~3 个 offset 验证该规律，命中则可**按 id 直接算出页偏移**，只拉含 gold doc
-的那几页；规律不匹配（例如 ``mteb/CodeEditSearchRetrieval`` 用 hash 当 ``_id``）时
+的那几页；规律不匹配（例如某些数据集把 hash 直接当 ``_id``）时
 回退到「顺序分页扫描 + 命中够了提前停」。两条路径都记进 ``meta.json``，便于复现。
 """
 
@@ -1293,7 +1293,7 @@ def safe_doc_filename(doc_id: str, ext: str) -> str:
 
 
 def diff_postimage(text: str) -> str:
-    """unified diff → **后像代码**（``mteb/CodeEditSearchRetrieval`` 的 corpus 全是 diff）。
+    """unified diff → **后像代码**（供 corpus 原文是补丁而非源码的数据集使用）。
 
     规则（只做「去补丁记号」，不改动任何代码字符）：
 

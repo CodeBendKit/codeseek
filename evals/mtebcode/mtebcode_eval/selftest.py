@@ -332,7 +332,7 @@ def _check_data_helpers(checker: _Checker) -> None:
         f"{len(data.TASKS)} tasks",
     )
 
-    # ---- 第 2 批：diff → 后像代码规整（CodeEditSearchRetrieval 的 corpus 全是 unified diff）----
+    # ---- 第 2 批：diff → 后像代码规整（历史任务族的 corpus 是 unified diff；现已无任务使用）----
     raw_diff = (
         "--- \n"
         "+++ \n"
@@ -357,7 +357,7 @@ def _check_data_helpers(checker: _Checker) -> None:
         repr(data.diff_postimage(indent_diff)),
     )
 
-    # ---- 100 个 CodeSearchNetRetrieval 语言分片（取代 CodeEditSearchRetrieval 系列）----
+    # ---- 100 个 CodeSearchNetRetrieval 语言分片 ----
     csn_names = list(data.CSN_TASK_NAMES)
     checker.check(
         "CSN 分片共 100 个且全部注册在 TASKS 里",
@@ -408,11 +408,23 @@ def _check_data_helpers(checker: _Checker) -> None:
         not forbidden_langs and not forbidden_names,
         ", ".join(forbidden_langs + forbidden_names) or "无",
     )
-    codeedit_leftover = [name for name in data.TASKS if name.startswith("CodeEditSearchRetrieval")]
+    registered_extras = sorted(name for name in data.TASKS if name not in set(csn_names))
+    expected_extras = sorted(
+        ["CosQA", "CodeSearchNetCCRetrieval"]
+        + [
+            "AppsRetrieval",
+            "CodeFeedbackMT",
+            "CodeFeedbackST",
+            "CodeTransOceanContest",
+            "CodeTransOceanDL",
+            "StackOverflowQA",
+            "SyntheticText2SQL",
+        ]
+    )
     checker.check(
-        "注册表里不再存在任何 CodeEditSearchRetrieval 前缀的任务",
-        not codeedit_leftover and "CodeSearchNetRetrieval" not in data.TASKS,
-        ", ".join(codeedit_leftover) or "无",
+        "注册表 = 100 个 CSN 分片 + 9 个既有任务（无其他任务族残留）",
+        registered_extras == expected_extras and "CodeSearchNetRetrieval" not in data.TASKS,
+        ", ".join(registered_extras),
     )
 
     # ---- shard_query_ids：确定性互斥切分（纯函数，1000 条 query 覆盖全部 3 个语言）----
