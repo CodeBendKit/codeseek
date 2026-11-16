@@ -2,7 +2,7 @@
 
 ``report.md`` 固定 5 个小节（与 README 的「打分协议」一一对应）：
 
-1. **Summary** —— 总体 Mean nDCG@10 + 按任务表；
+1. **Summary** —— 总体 Mean nDCG@10 + 按任务表（按任务名排序）+（若有 ``by_language``）**按语言汇总**；
 2. **Retrieval Mode Statistics** —— ``hybrid`` / ``name_fallback`` / ``unknown_empty`` 占比；
 3. **Per-Task Breakdown** —— 每任务的 nDCG / recall / MRR / 映射率；
 4. **Top 10 Worst Queries** —— 按 nDCG 升序，附「检索到但未命中」的样例；
@@ -38,6 +38,15 @@ def _ratio(part: int, total: int) -> float:
     return (part / total) if total else 0.0
 
 
+def _sorted_task_items(by_task: Mapping[str, Mapping[str, Any]]) -> list[tuple[str, Mapping[str, Any]]]:
+    """任务表格按任务名排序。
+
+    100 个 CSN 分片名为 ``CodeSearchNetRetrieval-<lang>-sNN``（NN 两位数补零），
+    因此**字典序就是自然序**（``-s01`` … ``-s34``），不需要额外的数字感知排序。
+    """
+    return sorted(by_task.items(), key=lambda item: item[0])
+
+
 def build_report(
     scoring: Mapping[str, Any],
     raws: Mapping[str, dict[str, Any]],
@@ -56,6 +65,7 @@ def build_report(
 
     aggregate_src = scoring.get("aggregate", {}) or {}
     by_task_src = scoring.get("by_task", {}) or {}
+    by_language_src = scoring.get("by_language", {}) or {}
 
     by_task: "dict[str, dict[str, Any]]" = {}
     for task, bucket in by_task_src.items():
@@ -73,6 +83,24 @@ def build_report(
             "mean_mapped": bucket.get("mean_mapped"),
             "mean_unmapped": bucket.get("mean_unmapped"),
             "with_errors": bucket.get("with_errors", 0),
+        }
+
+    by_language: "dict[str, dict[str, Any]]" = {}
+    for language, bucket in by_language_src.items():
+        by_language[language] = {
+            "n_tasks": bucket.get("n_tasks", 0),
+            "n_queries": bucket.get("n_queries", 0),
+            "n_scored": bucket.get("n_scored", 0),
+            "n_skipped": bucket.get("n_skipped", 0),
+            "ndcg_at_10": bucket.get("ndcg_at_10"),
+            "recall_at_10": bucket.get("recall_at_10"),
+            "mrr_at_10": bucket.get("mrr_at_10"),
+            "recall_at_k": bucket.get("recall_at_k"),
+            # 该语言各分片任务级均值的算术平均（与总体 Mean(Task) 同口径）
+            "mean_of_task_means": bucket.get("mean_of_task_means"),
+            "task_means": dict(bucket.get("task_means") or {}),
+            "task_names": list(bucket.get("task_names") or []),
+            "k": bucket.get("k", scoring.get("k", 10)),
         }
 
     mode_counts: dict[str, int] = dict(meta.get("mode_counts") or aggregate_src.get("mode_counts") or {})
@@ -142,6 +170,8 @@ def build_report(
         "search_limit": report_meta["search_limit"],
         "aggregation": aggregate_src.get("aggregation", "mean_of_task_means"),
         "by_task": by_task,
+        # 附加层：按语言汇总（100 个 CSN 分片 -> go / java / python）。空字典 = 该批次没有语言信息。
+        "by_language": by_language,
     }
 
     return {
@@ -401,6 +431,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     meta = report["meta"]
     aggregate = report["aggregate"]
     by_task: Mapping[str, Mapping[str, Any]] = aggregate.get("by_task") or {}
+    by_language: Mapping[str, Mapping[str, Any]] = aggregate.get("by_language") or {}
     mode_counts = meta.get("mode_counts") or {}
     ratio = meta.get("mode_ratio") or {}
     k = aggregate.get("k", 10)
@@ -452,7 +483,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     lines.append("")
     lines.append(f"| Task | Queries | nDCG@{k} | recall@{k} | MRR@{k} | recall@{search_limit} (search limit) |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
-    for task, bucket in by_task.items():
+    for task, bucket in _sorted_task_items(by_task):
         lines.append(
             f"| {task} | {bucket.get('n_scored')}/{bucket.get('n_queries')} | "
             f"{_fmt(bucket.get('ndcg_at_10'))} | {_fmt(bucket.get('recall_at_10'))} | "
@@ -470,6 +501,29 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "percentage-point accuracy."
     )
     lines.append("")
+    if by_language:
+        lines.append("### By Language")
+        lines.append("")
+        lines.append(
+            f"| Language | Shards | mean nDCG@{k} | mean recall@{k} | mean MRR@{k} | queries (scored/total) |"
+        )
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for language, bucket in by_language.items():
+            means = bucket.get("task_means") or {}
+            lines.append(
+                f"| {language} | {bucket.get('n_tasks', 0)} | "
+                f"{_fmt(means.get('ndcg_at_10', bucket.get('mean_of_task_means')))} | "
+                f"{_fmt(means.get('recall_at_10', bucket.get('recall_at_10')))} | "
+                f"{_fmt(means.get('mrr_at_10', bucket.get('mrr_at_10')))} | "
+                f"{bucket.get('n_scored')}/{bucket.get('n_queries')} |"
+            )
+        lines.append("")
+        lines.append(
+            "> The `mean *` columns are the arithmetic mean of the per-shard task means of that "
+            "language (the same `Mean(Task)` rule as above), so a language with more shards does not "
+            "outvote another one; `queries` counts every query of that language."
+        )
+        lines.append("")
 
     # ---------- 2. Retrieval mode statistics ----------
     total_queries = int(aggregate.get("n_queries") or 0) or 1
@@ -506,7 +560,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"| Task | Queries (scored/total) | nDCG@{k} | recall@{search_limit} (limit) | returned | mapped | unmapped | modes | errors |"
     )
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
-    for task, bucket in by_task.items():
+    for task, bucket in _sorted_task_items(by_task):
         modes = ", ".join(f"{name}×{count}" for name, count in sorted((bucket.get("mode_counts") or {}).items()))
         lines.append(
             f"| {task} | {bucket.get('n_scored')}/{bucket.get('n_queries')} | "

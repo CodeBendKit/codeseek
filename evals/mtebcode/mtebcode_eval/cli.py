@@ -5,8 +5,8 @@
 .. code-block:: bash
 
     python -m mtebcode_eval prepare --workdir /tmp/mtebcode-eval \\
-        --tasks CosQA,CodeSearchNetRetrieval,SyntheticText2SQL \\
-        --limit-queries 30 --corpus-size 300 --proxy http://127.0.0.1:7897
+        --tasks csn \\
+        --corpus-size 300 --proxy http://127.0.0.1:7897
     python -m mtebcode_eval run   --workdir /tmp/mtebcode-eval --limit 20 --concurrency 4
     python -m mtebcode_eval score --workdir /tmp/mtebcode-eval --k 10
     python -m mtebcode_eval selftest      # 完全离线，不依赖网络 / codeseek 二进制
@@ -34,6 +34,9 @@ __all__ = ["main"]
 
 DEFAULT_WORKDIR = "/tmp/mtebcode-eval"
 
+#: ``--tasks csn`` 别名：展开为 100 个 CodeSearchNetRetrieval 语言分片任务名。
+TASKS_ALIAS_CSN = "csn"
+
 
 # ---------------------------------------------------------------------------
 # 公共小工具
@@ -41,7 +44,21 @@ DEFAULT_WORKDIR = "/tmp/mtebcode-eval"
 
 
 def _parse_tasks(raw: str) -> list[str]:
-    values = [item.strip() for item in raw.split(",") if item.strip()]
+    """解析 ``--tasks``：逗号分隔的任务名，``csn`` 展开为全部 100 个 CSN 分片。"""
+    values: list[str] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if token.lower() == TASKS_ALIAS_CSN:
+            values.extend(data.CSN_TASK_NAMES)
+        else:
+            values.append(token)
+    ordered: list[str] = []
+    for value in values:
+        if value not in ordered:
+            ordered.append(value)
+    values = ordered
     unknown = [value for value in values if value not in data.TASKS]
     if unknown:
         raise argparse.ArgumentTypeError(
@@ -180,6 +197,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         return 2
 
     tasks_path = data.write_tasks(tasks, workdir / data.TASKS_FILE)
+    # 共享语料的任务共用同一个 corpora/<corpus_key>，因此这里按 corpus_dir 去重后再求和，
+    # 否则 100 个 CSN 分片会把 3 份 1,000 文档的语料重复计成 100,000。
+    pool_by_corpus: dict[str, int] = {}
+    for entry in task_meta:
+        key = str(entry.get("corpus_dir") or entry.get("task"))
+        pool_by_corpus[key] = max(pool_by_corpus.get(key, 0), int(entry.get("num_pool_docs") or 0))
     meta = {
         **data.benchmark_meta_header("huggingface-datasets-server", "prepare"),
         "workdir": str(workdir),
@@ -190,7 +213,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "tasks": task_meta,
         "n_tasks": len({task.task for task in tasks}),
         "n_queries": len(tasks),
-        "n_docs_total": sum(entry.get("num_pool_docs", 0) for entry in task_meta),
+        "n_docs_total": sum(pool_by_corpus.values()),
         "sampling_fingerprint": data.sampling_fingerprint(
             tasks, options.seed, options.corpus_size, options.limit_queries
         ),
@@ -403,9 +426,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--tasks",
         type=_parse_tasks,
         default=list(data.DEFAULT_TASKS),
-        help=f"逗号分隔的任务名，默认 {','.join(data.DEFAULT_TASKS)}；可选：{','.join(data.TASKS)}",
+        help=(
+            f"逗号分隔的任务名，默认 {','.join(data.DEFAULT_TASKS)}；"
+            f"别名 `{TASKS_ALIAS_CSN}` = 全部 {len(data.CSN_TASK_NAMES)} 个 "
+            f"CodeSearchNetRetrieval 语言分片（go 34 + java 33 + python 33）；"
+            f"其他可选：{','.join(name for name in data.TASKS if name not in data.CSN_TASK_NAMES)}"
+        ),
     )
-    prepare.add_argument("--corpus-size", type=int, default=300, help="每个任务的语料池大小（文档数，默认 300）")
+    prepare.add_argument(
+        "--corpus-size",
+        type=int,
+        default=300,
+        help="每个任务的语料池大小（文档数，默认 300）；full_corpus 任务（CSN 分片）忽略此项，物化整份语料",
+    )
     prepare.add_argument("--limit-queries", type=int, default=30, help="每个任务抽多少条 query（默认 30，0=全部）")
     prepare.add_argument("--seed", type=int, default=42, help="抽样随机种子（默认 42，保证可复现）")
     prepare.add_argument("--proxy", default=None, help="下载代理，如 http://127.0.0.1:7897（默认读 https_proxy）")

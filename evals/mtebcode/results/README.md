@@ -9,6 +9,12 @@ This archives codeseek's end-to-end retrieval results on a **100-query subset** 
 (measured, not estimated and not extrapolated from a sample). It holds a single batch: the
 **2026-11-13 short-query result (mean nDCG@10 = 0.5858)**.
 
+> ℹ️ **The `CE-*` (`CodeEditSearchRetrieval-*`) task family has been replaced by 100
+> `CodeSearchNetRetrieval-<lang>-sNN` shards** (go 34 / java 33 / python 33, `mteb/CodeSearchNetRetrieval`,
+> shared corpus per language). Those tasks are no longer registered, so this batch is **history only** and its
+> numbers are not comparable with a CSN batch — the corpus, the queries and the task set all changed.
+> See `../README.md` for the current protocol.
+
 | file | description |
 | --- | --- |
 | `2026-11-13-report.md` | **Primary result**: human-readable report (summary / retrieval-mode statistics / per-task breakdown / top-10 worst queries / reproduction commands) |

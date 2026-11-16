@@ -7,6 +7,9 @@
 * **任务级分数 = 该任务所有（可评分）query 的 mean nDCG@10**；
   **总体分数 = 任务级分数的算术平均** —— 这正是 MTEB 的 ``Mean(Task)`` 口径，
   不是「把所有 query 混在一起平均」（否则 query 多的任务会主导总分）。
+* **``by_language`` 是附加层**：把 100 个 CodeSearchNetRetrieval 分片按 go / java / python
+  汇总，同时给出「该语言所有 query 混合均值」与「该语言各片任务级均值的算术平均」。
+  它**不改变**总体 ``mean_ndcg_at_10`` 的 ``Mean(Task)`` 语义。
 * **没有正例的 query 跳过**（指标返回 ``None``），不计入均值，也不记 0 分。
 * 单题异常（raw 缺失 / docmap 读不到 / 检索报错）都会变成一条可追溯的记录，
   **不中断整体聚合**。
@@ -106,12 +109,14 @@ def score_tasks(
         )
 
     by_task = _aggregate_by_task(per_query, k)
+    by_language = _aggregate_by_language(per_query, k)
     aggregate = _aggregate_overall(per_query, by_task, k, search_limit)
     return {
         "k": int(k),
         "search_limit": int(max(1, int(search_limit))),
         "per_query": per_query,
         "by_task": by_task,
+        "by_language": by_language,
         "aggregate": aggregate,
     }
 
@@ -166,6 +171,44 @@ def _aggregate_by_task(per_query: Sequence[dict[str, Any]], k: int) -> dict[str,
     for row in per_query:
         buckets.setdefault(str(row.get("task") or ""), []).append(row)
     return {task: _task_bucket(rows, k) for task, rows in buckets.items()}
+
+
+#: ``by_language`` 里逐语言保留的任务级均值指标（与 :func:`_task_bucket` 的键一致）。
+_LANGUAGE_METRICS: tuple[str, ...] = ("ndcg_at_10", "recall_at_10", "mrr_at_10", "recall_at_k")
+
+
+def _aggregate_by_language(per_query: Sequence[dict[str, Any]], k: int) -> dict[str, dict[str, Any]]:
+    """按**语言**分组聚合 —— 100 个 CodeSearchNetRetrieval 分片按 go / java / python 汇总。
+
+    每个语言给出两层数字：
+
+    * 该语言所有 query 混合聚合的桶（复用 :func:`_task_bucket`）—— 描述「这个语言整体」；
+    * ``mean_of_task_means`` / ``task_means`` —— 该语言各**分片**任务级均值的算术平均，
+      与总体 ``Mean(Task)`` 同口径（片数不同、片内 query 数不同都不会让大片主导）。
+
+    语言顺序 = 首次出现顺序，输出稳定可 diff。``per_query`` 行里已带 ``language`` 字段，
+    因此这一层不需要回读 ``tasks.jsonl``。
+    """
+    buckets: "dict[str, list[dict[str, Any]]]" = {}
+    for row in per_query:
+        buckets.setdefault(str(row.get("language") or "unknown"), []).append(row)
+
+    result: dict[str, dict[str, Any]] = {}
+    for language, rows in buckets.items():
+        bucket = _task_bucket(rows, k)
+        by_task = _aggregate_by_task(rows, k)
+        task_means = {
+            name: _mean_of(
+                [float(item[name]) for item in by_task.values() if item.get(name) is not None]
+            )
+            for name in _LANGUAGE_METRICS
+        }
+        bucket["n_tasks"] = len(by_task)
+        bucket["task_names"] = list(by_task)
+        bucket["task_means"] = task_means
+        bucket["mean_of_task_means"] = task_means["ndcg_at_10"]
+        result[language] = bucket
+    return result
 
 
 def _aggregate_overall(

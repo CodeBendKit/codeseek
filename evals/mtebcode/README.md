@@ -1,9 +1,15 @@
 # MTEB(Code, v1) × codeseek end-to-end evaluation suite
 
-Measures codeseek's **code retrieval** on an [MTEB(Code, v1)](https://huggingface.co/datasets/mteb/CodeEditSearchRetrieval)-style
+Measures codeseek's **code retrieval** on an [MTEB(Code, v1)](https://huggingface.co/datasets/mteb/CodeSearchNetRetrieval)-style
 `nDCG@10` protocol, driven entirely from the command line against the real `codeseek` binary. The whole suite
 uses only the Python standard library, and every artifact is written under `--workdir` (default
 `/tmp/mtebcode-eval`), so **the repository is never polluted**.
+
+The benchmark is **100 tasks** cut from `mteb/CodeSearchNetRetrieval`: `go` 34 shards, `java` 33, `python` 33
+(`CodeSearchNetRetrieval-<lang>-s01` … `s34`). Each language contributes its full 1,000-document code corpus
+and its 1,000 queries, sliced into disjoint contiguous shards of ~30 queries, so the 100 shards together cover
+all **3,000** queries — and all shards of one language **share one corpus directory**, i.e. one
+`codeseek init` (3 corpora in total).
 
 > **Primary metric: `nDCG@10`.** The overall score is the **arithmetic mean of the per-task means**
 > (MTEB `Mean(Task)`), not a pooled mean over queries, so a task with 40 queries cannot outvote a task with 20.
@@ -27,8 +33,11 @@ uses only the Python standard library, and every artifact is written under `--wo
    ┌──────────────────────────────────────────────────────────────────────────────────────┐
    │ prepare ─ deterministic sampling (seed)                                              │
    │   1. keep every qrels row with score > 0                                             │
-   │   2. take `--limit-queries` queries per task (TaskSpec.query_quota overrides it)      │
+   │   2. shard: the language's 1,000 queries, sorted, split contiguously into N disjoint │
+   │      slices (go 34 / java 33 / python 33) -> ~30 queries per shard, union = all       │
    │   3. build the pool:  gold documents ∪ random distractors  -> `--corpus-size` docs    │
+   │      a `full_corpus` task materializes the whole 1,000-doc corpus instead, so every    │
+   │      shard of one language sees byte-identical docs/ + docmap.json (1 index / lang)   │
    │   4. materialize each document as a real file (extension from the language)          │
    │      + docmap.json  {relative path -> doc_id}                                        │
    │   5. `git init` in every corpus dir   (hard prerequisite for `codeseek init`)         │
@@ -70,33 +79,33 @@ cd evals/mtebcode
 #    (no network, no codeseek binary, no dataset)
 python3 -m mtebcode_eval selftest
 
-# 1. prepare: fetch + sample + pool + materialize + git init  (the parameters of the archived batch)
+# 1. prepare: fetch + shard + materialize + git init  (`--tasks csn` = all 100 CSN shards)
+#    The CSN shards ignore --limit-queries / --corpus-size: each shard takes its own contiguous
+#    slice of the language's 1,000 queries and the language's whole 1,000-document corpus.
 python3 -m mtebcode_eval prepare \
-  --workdir /tmp/mtebcode-ts \
-  --tasks CosQA,CodeEditSearchRetrieval-python,CodeEditSearchRetrieval-go,CodeEditSearchRetrieval-typescript \
-  --limit-queries 20 \
-  --corpus-size 300 \
+  --workdir /tmp/mtebcode-csn \
+  --tasks csn \
   --seed 42 \
   --parquet-cache ~/.cache/huggingface/hub \
   --proxy http://127.0.0.1:7897
 
-# 2. run: serial init + concurrent search + scoring + report
+# 2. run: serial init (3 corpora) + concurrent search (3,000 queries) + scoring + report
 python3 -m mtebcode_eval run \
-  --workdir /tmp/mtebcode-ts \
+  --workdir /tmp/mtebcode-csn \
   --limit 20 \
   --k 10 \
   --concurrency 4
 
 # 3. score: re-compute the metrics only (new --k, no retrieval re-run)
-python3 -m mtebcode_eval score --workdir /tmp/mtebcode-ts --limit 20 --k 10
+python3 -m mtebcode_eval score --workdir /tmp/mtebcode-csn --limit 20 --k 10
 ```
 
 | command | flag | meaning |
 | --- | --- | --- |
 | `prepare` | `--workdir` | where `cache/`, `corpora/`, `tasks.jsonl`, `meta.json` land |
-| | `--tasks` | comma-separated task names from the `TaskSpec` registry |
-| | `--limit-queries` | queries per task (default 30; `0` = all); a `TaskSpec.query_quota` overrides it per task |
-| | `--corpus-size` | documents in the pool per task (default 300) |
+| | `--tasks` | comma-separated task names from the `TaskSpec` registry; the alias `csn` expands to all 100 CSN shards |
+| | `--limit-queries` | queries per task (default 30; `0` = all); a `TaskSpec.query_quota` overrides it per task — the CSN shards pin it to `0` so every shard always slices the full 1,000 queries |
+| | `--corpus-size` | documents in the pool per task (default 300); **ignored by `full_corpus` tasks** (the CSN shards materialize their whole 1,000-doc corpus so all shards of a language can share one index) |
 | | `--seed` | sampling seed (default 42; the resulting `sampling_fingerprint` is recorded in `meta.json`) |
 | | `--proxy` | download proxy (falls back to `https_proxy`) |
 | | `--parquet-cache` | local HF hub directory; a cached `(config, split)` is read from disk instead of the network |
@@ -121,32 +130,40 @@ python3 -m mtebcode_eval score --workdir /tmp/mtebcode-ts --limit 20 --k 10
    (1 s, 2 s, 4 s …). When a local HF parquet cache holds the `(config, split)` pair it is read **from disk**
    instead, which is the practical answer to `429 Too Many Requests`.
 2. **Task screening comes before sampling.** A task is only usable when three things hold: the queries are short
-   enough to be a realistic search query, the corpus text is actually code (not a docstring and not a unified
-   diff), and the corpus is materializable into an extension codeseek indexes. Measured medians that drove this
-   filter: CosQA is short, `CodeEditSearchRetrieval-{python,go,typescript}` have medians of 45 / 45 / 44
-   characters, while `CodeFeedbackST` (540), `CodeTransOceanContest` (547), `CodeSearchNetRetrieval` (624),
-   `StackOverflowQA` (883), `CodeTransOceanDL` (1,211), `AppsRetrieval` (1,316) and `CodeFeedbackMT` (3,571)
-   were rejected for query length. `SyntheticText2SQL` was rejected because a `.sql` corpus is outside
-   codeseek's extension whitelist. The full table is Section 2.1 of [`results/README.md`](results/README.md).
-3. **Sampling is deterministic.** `--seed` fixes which queries and which distractors are taken; the resulting
-   `sampling_fingerprint` (a hash of the task list, seed, `corpus-size` and `--limit-queries`) is written to
-   `meta.json`, so two runs with the same fingerprint are the same 100 queries and the same pools.
-4. **Pooling.** The corpus of a task is **not** the full dataset: it is `gold documents ∪ random distractors`
-   up to `--corpus-size` (300). If the number of gold documents alone exceeds `--corpus-size`, the list is
-   **truncated** and a warning is appended to `meta.prepare_warnings` ("some queries lost their gold document, the
-   metric will read low"). If a query's gold documents all fall outside the pool, the query is recorded as
-   skipped instead of silently scoring 0.
+   enough to be a realistic search query, the corpus text is actually code, and the corpus is materializable
+   into an extension codeseek indexes. The current task set is the **100-shard
+   `mteb/CodeSearchNetRetrieval` benchmark** (go / java / python): its corpus rows are real source files
+   (docstrings moved to the query side) and its queries are stripped natural-language docstrings. The CoIR
+   tasks that were screened out stay in the registry with an explicit `excluded_reason` — `CodeFeedbackST`
+   (median query 540 chars), `CodeTransOceanContest` (547), `StackOverflowQA` (883), `CodeTransOceanDL` (1,211),
+   `AppsRetrieval` (1,316), `CodeFeedbackMT` (3,571) for query length, and `SyntheticText2SQL` because a `.sql`
+   corpus is outside codeseek's extension whitelist. `ruby` is excluded too: `.rb` is not in that whitelist, so
+   its corpus would index as 0 files; `javascript` and `php` are excluded by requirement. The full screening
+   table is Section 2.1 of [`results/README.md`](results/README.md).
+3. **Sampling is deterministic.** `--seed` fixes which distractors are taken, the shard slice is a pure
+   function of the sorted query list, and the resulting `sampling_fingerprint` (a hash of the task list, seed,
+   `corpus-size` and `--limit-queries`) is written to `meta.json`, so two runs with the same fingerprint are
+   the same queries and the same pools.
+4. **Pooling.** For a classic task the corpus is **not** the full dataset: it is `gold documents ∪ random
+   distractors` up to `--corpus-size` (300). If the number of gold documents alone exceeds `--corpus-size`, the
+   list is **truncated** and a warning is appended to `meta.prepare_warnings` ("some queries lost their gold
+   document, the metric will read low"). If a query's gold documents all fall outside the pool, the query is
+   recorded as skipped instead of silently scoring 0. **`full_corpus` tasks (all 100 CSN shards) bypass pooling
+   entirely**: the whole 1,000-document corpus is materialized in the corpus' original order, which is what makes
+   the shards of one language share a single index (`--corpus-size` is ignored, and `n_pool_docs_target` in
+   `meta.json` records the real pool size).
 5. **Materialization.** Each pooled document is written as a real file whose extension comes from the task's
-   language (`.py`, `.go`, `.ts`, `.sql`, `.txt`), because codeseek's indexer only picks up
+   language (`.py`, `.go`, `.java`, `.ts`, `.sql`, `.txt`), because codeseek's indexer only picks up
    `cpp/cc/cxx/c++/c/h/hpp/hxx/hh/inl/inc/tpp/tpl/py/py3/pyx/java/rs/ts/tsx/js/jsx/go`
    (`rust-core/src/codegraph/parser.rs`, `is_supported_file`). The file name is
    `<dataset-stem>_<sha1(doc_id)[:8]><ext>` — the hash prefix keeps two documents with the same stem from
    colliding — and `docmap.json` records `{relative POSIX path -> doc_id}` for the reverse mapping. `.sql` and
-   `.txt` files are **not** given a title comment (those corpora must stay byte-exact); code files may carry one.
-   For the `CodeEditSearchRetrieval` family the raw corpus is a **unified diff** (`1,000 of 1,000` rows measured),
-   so `TaskSpec.diff_postimage = True` rewrites it to post-image code first (drop `@@`/`---`/`+++` headers and
-   `-` lines, strip the 1-character prefix from `+`/space lines) — writing 30 raw diffs as `.py` only lets
-   codeseek index **9 files / 11 symbols**, against **17 files / 80 symbols** after normalisation.
+   `.txt` files are **not** given a title comment (those corpora must stay byte-exact); code files may carry one,
+   but the CSN shards set `code_like = False` because their `title` field is always the empty string.
+   **Primary keys are read as `row["id"] or row["_id"]`**: the official MTEB datasets use `id` (CoIR uses
+   `_id`), and `qrels` accept both `query-id`/`corpus-id` and `query_id`/`corpus_id`. The historical
+   `CodeEditSearchRetrieval` corpus was a unified diff and needed `TaskSpec.diff_postimage`; that helper and its
+   unit tests are kept, but **no registered task uses it any more**.
 6. **The search call.** Exactly one process per query:
    `[binary, "search", query_text, "--json", "--limit", str(K)]` with `cwd = <corpus_dir>` and **no shell**
    (an argv list, `shell=False`), so a query containing quotes or `$` cannot be reinterpreted. A non-zero exit,
@@ -166,27 +183,35 @@ python3 -m mtebcode_eval score --workdir /tmp/mtebcode-ts --limit 20 --k 10
    aggregation. `recall@k` and `MRR@k` use the same ranked list; `recall@k` additionally uses the real search
    budget (`--limit`, i.e. 20 in the archived batch) while `nDCG` / `MRR` stay at `k = 10`.
 9. **Aggregation.** A task's score is the **mean over its scorable queries**; the overall score is the
-   **arithmetic mean of the per-task means** — MTEB's `Mean(Task)`. `aggregate.aggregation` is written into the
-   report as `mean_of_task_means` so nobody can misread it as a pooled mean. A single broken query becomes a
-   traceable record and **does not abort** the aggregation.
+   **arithmetic mean of the per-task means** — MTEB's `Mean(Task)`, taken over the 100 shard means.
+   `aggregate.aggregation` is written into the report as `mean_of_task_means` so nobody can misread it as a
+   pooled mean. A single broken query becomes a traceable record and **does not abort** the aggregation.
+   `aggregate.by_language` adds a **per-language layer** (go / java / python): `n_tasks` (shards of that
+   language) plus `task_means` / `mean_of_task_means`, again the arithmetic mean of that language's shard means.
+   It is an extra view only — the overall number keeps its `Mean(Task)` semantics.
 10. **No LLM involved.** No generative model scores anything anywhere in the pipeline: relevance is the dataset's
     `qrels`, and every metric is closed-form arithmetic over the returned ranking.
 
 ## 5. Known limitations and risks
 
-- **Pooling distorts difficulty.** A 300-document pool is far smaller than the real corpus (the Hub reports
-  **20,604** corpus rows for CosQA), so absolute recall here is **systematically higher** than on the full corpus.
-  Numbers are comparable across batches of this suite, **never** against the MTEB leaderboard or another harness.
+- **Pooling distorts difficulty (classic tasks only).** A 300-document pool is far smaller than the real corpus
+  (the Hub reports **20,604** corpus rows for CosQA), so absolute recall there is **systematically higher** than
+  on the full corpus. The 100 CSN shards do **not** pool — they index the whole 1,000-document corpus of their
+  language — but that corpus is itself a 1,000-row sample of CodeSearchNet. Numbers are comparable across
+  batches of this suite, **never** against the MTEB leaderboard or another harness.
 - **A single gold document per query makes nDCG@10 and MRR@10 monotone transforms of the same rank**
-  (`nDCG = 1/log2(rank+1)`, `MRR = 1/rank`). The only independent signal is **recall**; decoupling ordering
-  quality would need multi-gold tasks or graded relevance.
+  (`nDCG = 1/log2(rank+1)`, `MRR = 1/rank`). `mteb/CodeSearchNetRetrieval`'s qrels are exactly 1 query ↔ 1
+  document with `score = 1`, so the only independent signal is **recall**; decoupling ordering quality would
+  need multi-gold tasks or graded relevance.
 - **`recall@10 == recall@20` in the archived batch**, i.e. no gold document ever lands in positions 11–20. The
   budget of 20 is sufficient, but the protocol measures **nothing** about positions 11–20.
-- **`CodeEditSearchRetrieval`'s corpus is a unified diff**, only 33.3–62.3% of whose post-image documents contain
-  a definition at all, while its queries are commit-message shaped. That task family partly measures the
-  unretrievability of diffs rather than retrieval quality (see Section 4.3 of [`results/README.md`](results/README.md)).
-- **The dataset exposes only a `train` split**, java has **no qrels at all** and ruby returns 500, so the family
-  is covered by three languages out of six (`python`, `go`, `typescript`).
+- **Only go / java / python are covered.** `javascript` and `php` are excluded by requirement; `ruby` is excluded
+  because `.rb` is not in codeseek's extension whitelist, so its corpus would index as 0 files. All three configs
+  of `mteb/CodeSearchNetRetrieval` expose a single `test` split — there is no train/valid to fall back on.
+- **Shards are unequal by construction.** 1,000 queries cannot be split evenly into 34 or 33 slices: the go
+  shards hold 29–30 queries and the java / python shards 30–31. Because the overall score is `Mean(Task)` over
+  shards (not over queries), a language with more shards does not gain weight — but a single-figure difference
+  between two shards is within one query's worth of noise.
 - **The reranker is an uncontrolled variable**: `enabled` with `top_n = 5`, but
   `derived_top_n = max(top_n, final_budget) = 20`, so its effect on short queries was not measured.
 - **Every result is bound to its cutoff configuration.** With the default `index.hybrid.cutoff.enabled = true`, the
@@ -214,7 +239,7 @@ evals/mtebcode/
 │   └── 2026-11-13-report.json
 └── mtebcode_eval/
     ├── __init__.py
-    ├── data.py       # TaskSpec registry / datasets-server client / pooling / materialization / diff post-image
+    ├── data.py       # TaskSpec registry (100 CSN shards) / datasets-server client / sharding / materialization
     ├── adapter.py    # binary detection / init / search / tolerant JSON parsing / result -> doc_id mapping
     ├── metric.py     # nDCG@k / recall@k / MRR@k / precision@k, all closed-form
     ├── scorer.py     # per-query scoring + per-task and overall aggregation
@@ -228,15 +253,15 @@ evals/mtebcode/
 `<workdir>` layout:
 
 ```
-/tmp/mtebcode-ts/
+/tmp/mtebcode-csn/
 ├── cache/                       # one JSON page per (dataset, config, split, offset)
-├── corpora/<task-slug>/
-│   ├── docs/<stem>_<sha1[:8]>.<ext>   # the pooled documents, as real files
+├── corpora/<corpus_key|task_slug>/    # CSN shards use csn-go / csn-java / csn-python (shared!)
+│   ├── docs/<stem>_<sha1[:8]>.<ext>   # the pooled (or full-corpus) documents, as real files
 │   └── docmap.json                    # {relative path -> doc_id}
 ├── tasks.jsonl                  # one line per query: task / query_id / query_text / qrels / docmap_path ...
-├── meta.json                    # task list / corpus size / seed / sampling_fingerprint / prepare warnings
+├── meta.json                    # task list / corpus size / seed / sampling_fingerprint / shard / prepare warnings
 ├── raw/<task_id>.json           # per-query retrieval result (results / mode / elapsed_s / error)
-├── report.json
+├── report.json                  # meta / aggregate (incl. by_language) / per_query / failure_top / warnings
 └── report.md
 ```
 
@@ -255,15 +280,20 @@ evals/mtebcode/
   very long input; (4) did `docmap.json` get written — a missing or empty docmap is reported in `per_query.error`.
 - **`429 Too Many Requests` from `/rows`**: lower the request rate with a larger `--rate-limit`, or point
   `--parquet-cache` at a populated `~/.cache/huggingface/hub` so the rows can be read from disk.
-  **`500` from `/rows`**: that config's parquet is unreadable by the datasets server. This is how `ruby` was
-  ruled out, and how `typescript` is *served*: with `--parquet-cache` pointing at a populated HF hub the same
-  config reads fine from disk.
+  **`500` from `/rows`**: that config's parquet is unreadable by the datasets server — the historical reason
+  `ruby` was ruled out (and why the old `typescript` task needed `--parquet-cache`).
 - **Binary not found**: the error message prints the exact
   `cargo build --release --manifest-path rust-core/Cargo.toml` command; `--auto-build` builds it for you.
 - **`--cache-only`** turns any cache miss into an immediate error, which is the reliable way to prove a
   reproduction is fully offline.
 
 ## 8. Measured results
+
+> ⚠️ **The archived batch below predates the switch to `mteb/CodeSearchNetRetrieval`.** It covered 4 tasks
+> (CosQA + the three `CodeEditSearchRetrieval` languages), and that task family is **no longer registered**:
+> it has been replaced by the 100 CSN shards described above (see Section 5). The numbers stay here as
+> history — they are **not** comparable with a CSN batch, because the corpus, the queries and the task set all
+> changed. `results/README.md` keeps the full analysis of that batch.
 
 **The archived primary result is the 2026-11-13 batch: mean nDCG@10 = 0.5858** — 100 queries over 4 tasks
 (40 CosQA + 20 each for `CodeEditSearchRetrieval-{python,go,typescript}`), a 300-document pooled corpus per task

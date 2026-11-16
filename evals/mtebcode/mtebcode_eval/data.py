@@ -15,17 +15,26 @@
 * 字段名统一：corpus / queries 为 ``_id, text, title, partition, language``
   （``synthetic-text2sql`` 的 queries 额外带 ``context`` = SQL schema）；
   qrels 为 ``query-id, corpus-id, score``（``score`` 为 int，1 表示相关）。
+* **主键兼容**：官方 MTEB 数据集（如 ``mteb/CodeSearchNetRetrieval``）用 ``id`` 而不是 ``_id``，
+  qrels 也可能用 ``query_id`` / ``corpus_id``。因此所有读主键的地方都走 :func:`_row_doc_id`
+  （``row["id"] or row["_id"]``），qrels 走 ``query-id`` → ``query_id`` 的兜底。
 
 池化抽样（与 repoqa 的「100 题子集」哲学一致，但 MTEB 的 corpus 有 2 万~28 万文档，
 不可能全量索引）：
 
 1. 拉 qrels 的评测 split，得到 ``query_id -> {corpus_id: score}``（只保留 ``score > 0``）；
 2. query_id 排序后按固定 seed 抽样 ``--limit-queries`` 条；
+   **分片任务**（``TaskSpec.shard_index/shard_total`` 非空）改为把候选集连续均分成 N 片，
+   本任务只取其中一片（见 :func:`shard_query_ids`）；
 3. corpus 池 = 抽样 query 的**全部 gold doc** ∪ 从 corpus 里随机抽的干扰文档，直到
    ``--corpus-size``；
-4. 只物化池内文档到 ``<workdir>/corpora/<task_slug>/docs/``，并写 ``docmap.json``
+4. 只物化池内文档到 ``<workdir>/corpora/<corpus_key 或 task_slug>/docs/``，并写 ``docmap.json``
    （``{相对路径: doc_id}``）供打分时反查 —— **打分不猜路径**；
 5. ``git init``（``codeseek init`` 的硬前置），写 ``tasks.jsonl`` + ``meta.json``。
+
+**例外：``TaskSpec.full_corpus=True``（100 个 CodeSearchNetRetrieval 分片）跳过第 3/4 步的池化**，
+改为按 corpus 原始顺序物化**全部**行 —— 同语言的 1,000 文档被该语言所有分片共享，因此
+``docs/`` 与 ``docmap.json`` 逐字节一致，只需一次 ``codeseek init``（3 个语言 = 3 次 init）。
 
 关于「边拉边筛、命中够了就提前停」：coIR 系列数据集的 ``_id`` 呈位置规律
 （实测 cosqa 的 offset 0 → ``d1, d2, d3``，即 ``id = prefix + (行号 + 1)``；
@@ -55,6 +64,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 __all__ = [
+    "CSN_SHARD_LANGS",
+    "CSN_TASK_NAMES",
     "DEFAULT_TASKS",
     "PAGE_SIZE",
     "PrepareOptions",
@@ -73,6 +84,7 @@ __all__ = [
     "resolve_layout",
     "resolve_qrels_split",
     "safe_doc_filename",
+    "shard_query_ids",
     "task_slug",
     "write_tasks",
     "write_workdir_meta",
@@ -131,6 +143,15 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _row_doc_id(row: dict[str, Any]) -> str:
+    """行主键：官方 MTEB 数据集用 ``id``，CoIR 系列用 ``_id`` —— 两者都兼容。
+
+    返回空串表示该行没有主键（调用方按「跳过」处理）。**所有**读 corpus / queries 主键的
+    地方都必须走这里，否则 ``mteb/CodeSearchNetRetrieval``（只有 ``id``）会整个读空。
+    """
+    return str(row.get("id") or row.get("_id") or "")
+
+
 class DatasetError(RuntimeError):
     """数据源相关错误（下载失败 / config-split 不存在 / qrels 为空等）。"""
 
@@ -166,6 +187,15 @@ class TaskSpec:
         **后像代码**（丢弃 ``@@``/``---``/``+++`` 头与 ``-`` 删除行，去掉 ``+``/空格 的
         1 字符前缀）。实测：30 篇 diff 直接落成 ``.py`` 只被 codeseek 索引出 9 文件/11 符号，
         规整后 17 文件/80 符号 —— 不规整则 .py 语料几乎无法被 tree-sitter 解析。
+    :param corpus_key: 非空时作为**共享语料**的目录键：同键的多个任务落到同一个
+        ``<workdir>/corpora/<corpus_key>``，从而复用同一次 ``codeseek init``
+        （100 个 CSN 分片只需 3 个语料目录 = 3 次 init）。
+    :param full_corpus: ``True`` 时物化该 corpus config 的**全部**行，不按 ``--corpus-size``
+        裁剪、不随机抽干扰文档。共享语料正确性的前提：同语言各分片必须看到完全相同的
+        ``docs/`` 与 ``docmap.json``。
+    :param shard_index: 确定性分片：本任务取第几片（0-based）。
+    :param shard_total: 确定性分片：该语言共几片。与 ``shard_index`` 同时非空才生效，
+        切片口径见 :func:`shard_query_ids`。
     """
 
     name: str
@@ -179,6 +209,10 @@ class TaskSpec:
     excluded_reason: str = ""
     query_quota: int | None = None
     diff_postimage: bool = False
+    corpus_key: str = ""
+    full_corpus: bool = False
+    shard_index: int | None = None
+    shard_total: int | None = None
 
     @property
     def slug(self) -> str:
@@ -206,7 +240,9 @@ def _lang_layout(
 _DEFAULT_LAYOUT = Layout("corpus", "corpus", "queries", "queries", "default", ("test", "valid", "train"))
 
 
-#: **任务注册表**。前 3 个是默认集，必须开箱可用。
+#: **任务注册表**。下列 CoIR 条目是本机逐条实测过的历史任务集；默认集见
+#: :data:`DEFAULT_TASKS`（只有 CosQA），100 个 CodeSearchNetRetrieval 语言分片在文件末尾
+#: 由 :func:`_csn_shard_specs` 批量注册。
 #:
 #: config/split 全部于本机实测确认（``/splits`` 接口逐条核对），因此 ``unverified`` 均为
 #: ``False``；``unverified`` 机制保留给以后新增、尚未探测的任务。
@@ -226,22 +262,6 @@ TASKS: "OrderedDict[str, TaskSpec]" = OrderedDict(
                 # 因此配额下沉到注册表。
                 query_quota=40,
                 note="NL -> Python code; qrels test has 500 rows (matches MTEB's 500 queries).",
-            ),
-        ),
-        (
-            "CodeSearchNetRetrieval",
-            TaskSpec(
-                name="CodeSearchNetRetrieval",
-                hf_dataset="CoIR-Retrieval/CodeSearchNet",
-                layout=_lang_layout("python"),
-                doc_ext=".py",
-                code_like=True,
-                language="python",
-                excluded_reason=(
-                    "query too long (median 624 chars); corpus text is the docstring "
-                    "(only 12.7% code-like) -> codeseek indexed 1 file / 3 symbols"
-                ),
-                note="code <-> code (python sub-config); python-qrels/test has 14,918 rows.",
             ),
         ),
         (
@@ -353,115 +373,84 @@ TASKS: "OrderedDict[str, TaskSpec]" = OrderedDict(
                 note="code -> code (python sub-config) on CodeSearchNet.",
             ),
         ),
-        # ---- 第 2 批（全短 query 任务集）：CodeEditSearchRetrieval 的语言子任务 ----
-        # config/split 于本机逐条实测（/splits + /rows + HF parquet 仓库三方核对）：
-        #   * 该数据集所有 config **只有 train 一个 split**；
-        #   * go / python：corpus + queries + qrels 三个接口均 HTTP 200（各 1,000 行）；
-        #   * typescript：datasets-server 的 /rows 对三个 config 全部 500，但数据集**官方 parquet**
-        #     在本机 HF 缓存里可读（corpus 320,945 B / queries 48,594 B / qrels 48,818 B，各 1,000 行），
-        #     因此该语言必须走 `--parquet-cache`；`{lang}-corpus` 目录命名正是官方文件布局，
-        #     `ParquetRows._matches` 天然解析得到，不需要任何额外分支；
-        #   * javascript：**已被 operator 决定移除**（引擎对该语言的处理不满足评测要求），
-        #     原来那条 -javascript spec 已删除，位置由 -typescript 接替；旧数字只作为历史留在
-        #     results/README.md，不允许再被选中，避免污染批次对比；
-        #   * java：只有 java-corpus / java-queries，**仓库里根本没有 java-qrels**（/rows 404），
-        #     因此 java 不可用（注意 java 本身在 codeseek 白名单里，缺的是 qrels 那一半）；
-        #   * ruby：三个 config 的 /rows 全部 500，本地也没有 parquet；.rb 另不在索引白名单。
-        # qrels split 优先级仍是 test → valid → train，实际只会落到 train。
-        (
-            "CodeEditSearchRetrieval-python",
-            TaskSpec(
-                name="CodeEditSearchRetrieval-python",
-                hf_dataset="mteb/CodeEditSearchRetrieval",
-                layout=_lang_layout("python", corpus_split="train", queries_split="train"),
-                doc_ext=".py",
-                code_like=True,
-                language="python",
-                query_quota=20,
-                # corpus 原文 100% 是 unified diff（实测 1000/1000），必须规整成后像代码
-                diff_postimage=True,
-                note=(
-                    "code-edit -> description (commit message). corpus text is a unified diff; "
-                    "queries are 21-1811 chars (median 45). hash _ids -> scan fallback (10 pages)."
-                ),
-            ),
-        ),
-        (
-            "CodeEditSearchRetrieval-go",
-            TaskSpec(
-                name="CodeEditSearchRetrieval-go",
-                hf_dataset="mteb/CodeEditSearchRetrieval",
-                layout=_lang_layout("go", corpus_split="train", queries_split="train"),
-                doc_ext=".go",
-                code_like=True,
-                language="go",
-                query_quota=20,
-                diff_postimage=True,
-                note="same dataset, go sub-config; queries 19-1529 chars (median 45).",
-            ),
-        ),
-        # REMOVED BY OPERATOR DECISION -- the `-javascript` entry used to live here:
-        #   name="CodeEditSearchRetrieval-javascript", doc_ext=".js", language="javascript", 20 queries.
-        # It was dropped by operator decision (the engine's handling of that language did not meet the
-        # evaluation requirement) and replaced by `-typescript` below. No runnable spec is registered for
-        # it, so `--tasks` can no longer select it; its old numbers survive only as history in
-        # results/README.md. Re-adding it would require a deliberate, documented decision.
-        (
-            "CodeEditSearchRetrieval-typescript",
-            TaskSpec(
-                name="CodeEditSearchRetrieval-typescript",
-                hf_dataset="mteb/CodeEditSearchRetrieval",
-                layout=_lang_layout("typescript", corpus_split="train", queries_split="train"),
-                doc_ext=".ts",
-                code_like=True,
-                language="typescript",
-                query_quota=20,
-                diff_postimage=True,
-                note=(
-                    "same dataset, typescript sub-config; queries 19-659 chars (median 44, 3.6% > 200). "
-                    "datasets-server /rows answers 500 for all three configs, so this language is read "
-                    "from the official parquet files through --parquet-cache (corpus 320,945 B / "
-                    "queries 48,594 B / qrels 48,818 B, 1,000 rows each). hash _ids -> scan fallback."
-                ),
-            ),
-        ),
-        (
-            "CodeEditSearchRetrieval-java",
-            TaskSpec(
-                name="CodeEditSearchRetrieval-java",
-                hf_dataset="mteb/CodeEditSearchRetrieval",
-                layout=_lang_layout("java", corpus_split="train", queries_split="train"),
-                doc_ext=".java",
-                code_like=True,
-                language="java",
-                excluded_reason="java-qrels config does not exist in the dataset (404)",
-                note=(
-                    "java-corpus and java-queries exist (1,000 rows each), but the repository has no "
-                    "java-qrels at all, so there is no relevance signal to score against."
-                ),
-            ),
-        ),
-        (
-            "CodeEditSearchRetrieval-ruby",
-            TaskSpec(
-                name="CodeEditSearchRetrieval-ruby",
-                hf_dataset="mteb/CodeEditSearchRetrieval",
-                layout=_lang_layout("ruby", corpus_split="train", queries_split="train"),
-                doc_ext=".rb",
-                code_like=True,
-                language="ruby",
-                excluded_reason="all three configs return 500 and .rb is outside the indexer whitelist",
-                note=(
-                    "no ruby parquet exists in the local cache either; even with readable data, .rb is "
-                    "not in codeseek's is_supported_file whitelist, so the corpus would index as 0 files."
-                ),
-            ),
-        ),
     )
 )
 
-#: 默认评测集：覆盖 NL→code（CosQA）、code→code（CSN）、NL→SQL（Text2SQL）三种形态。
-DEFAULT_TASKS: tuple[str, ...] = ("CosQA", "CodeSearchNetRetrieval", "SyntheticText2SQL")
+# ---------------------------------------------------------------------------
+# CodeSearchNetRetrieval：100 个语言分片（mteb/CodeSearchNetRetrieval）
+# ---------------------------------------------------------------------------
+
+#: ``(语言, 文件扩展名, 分片数)`` —— go 34 + java 33 + python 33 = **100 个任务**。
+#:
+#: 只评测这三种语言：javascript / php 按需求排除；ruby 因 ``.rb`` 不在 codeseek 的扩展名
+#: 白名单（``rust-core/src/codegraph/parser.rs::is_supported_file``）里，物化后会被索引成
+#: 0 文件，故排除。
+CSN_SHARD_LANGS: tuple[tuple[str, str, int], ...] = (
+    ("go", ".go", 34),
+    ("java", ".java", 33),
+    ("python", ".py", 33),
+)
+
+
+def _csn_layout(language: str) -> Layout:
+    """``mteb/CodeSearchNetRetrieval`` 的布局：三个 config 的 split **全部是** ``test``。"""
+    return _lang_layout(language, corpus_split="test", queries_split="test", qrels_splits=("test",))
+
+
+def _csn_shard_specs() -> tuple[tuple[str, TaskSpec], ...]:
+    """批量生成 100 个分片任务（避免手写 100 段重复字面量）。
+
+    切分口径：每个语言的 1,000 条 query（qrels 的 query_id 排序后）被**连续均分**给该语言的
+    所有分片（见 :func:`shard_query_ids`），因此 100 片的并集 = 全部 3,000 条 query、片与片
+    互不重叠；同一语言的 1,000 个 corpus 文档被该语言所有分片共享（``corpus_key`` 相同 +
+    ``full_corpus`` 全量物化），运行时只有 3 个语料目录、3 次 ``codeseek init``。
+    """
+    specs: list[tuple[str, TaskSpec]] = []
+    for language, doc_ext, total in CSN_SHARD_LANGS:
+        for index in range(total):
+            name = f"CodeSearchNetRetrieval-{language}-s{index + 1:02d}"
+            specs.append(
+                (
+                    name,
+                    TaskSpec(
+                        name=name,
+                        hf_dataset="mteb/CodeSearchNetRetrieval",
+                        layout=_csn_layout(language),
+                        doc_ext=doc_ext,
+                        # title 全为空串 -> 不需要往代码里插注释（保持与官方 corpus 文本一致）
+                        code_like=False,
+                        language=language,
+                        # 0 = 跳过 --limit-queries 抽样，让每片从该语言全部 1,000 条 query 里切
+                        query_quota=0,
+                        corpus_key=f"csn-{language}",
+                        full_corpus=True,
+                        shard_index=index,
+                        shard_total=total,
+                        note=(
+                            f"{language} shard {index + 1:02d}/{total} of mteb/CodeSearchNetRetrieval: "
+                            f"a contiguous slice of the same sorted 1,000-query list "
+                            f"(~{1000 // total} queries per shard); all {total} shards share "
+                            f"corpora/csn-{language} (1,000 corpus docs, one `codeseek init`)."
+                        ),
+                    ),
+                )
+            )
+    return tuple(specs)
+
+
+_CSN_SHARD_SPECS: tuple[tuple[str, TaskSpec], ...] = _csn_shard_specs()
+
+TASKS.update(_CSN_SHARD_SPECS)
+
+#: 100 个分片任务名（供 CLI 的 ``--tasks csn`` 别名与自检复用）。
+CSN_TASK_NAMES: tuple[str, ...] = tuple(name for name, _spec in _CSN_SHARD_SPECS)
+
+#: 默认评测集：只留一条**必然可跑**的冒烟任务（NL → code）。
+#:
+#: 历史值是 ``("CosQA", "CodeSearchNetRetrieval", "SyntheticText2SQL")``，后两条都带
+#: ``excluded_reason``，导致不带 ``--tasks`` 跑 ``prepare`` 直接抛 DatasetError。
+#: 100 个 CSN 分片体量大，不适合当默认值；用 ``--tasks csn`` 一键选中。
+DEFAULT_TASKS: tuple[str, ...] = ("CosQA",)
 
 
 def task_slug(name: str) -> str:
@@ -470,9 +459,16 @@ def task_slug(name: str) -> str:
 
 
 def corpus_dir(workdir: Path | str, spec_or_name: "TaskSpec | str") -> Path:
-    """语料目录：``<workdir>/corpora/<task_slug>``。"""
-    slug = spec_or_name.slug if isinstance(spec_or_name, TaskSpec) else task_slug(spec_or_name)
-    return Path(workdir) / CORPORA_DIR / slug
+    """语料目录：``<workdir>/corpora/<corpus_key 或 task_slug>``。
+
+    ``TaskSpec.corpus_key`` 非空时优先用它 —— 这是**共享语料**的机制：100 个 CSN 分片里
+    同语言的多个任务共用 ``corpora/csn-<lang>``，从而只做一次 ``codeseek init``。
+    """
+    if isinstance(spec_or_name, TaskSpec):
+        key = spec_or_name.corpus_key or spec_or_name.slug
+    else:
+        key = task_slug(spec_or_name)
+    return Path(workdir) / CORPORA_DIR / key
 
 
 # ---------------------------------------------------------------------------
@@ -990,7 +986,7 @@ def probe_id_scheme(
         rows = payload.get("rows") or []
         if not rows:
             return None
-        doc_id = str((rows[0].get("row") or {}).get("_id") or "")
+        doc_id = _row_doc_id(rows[0].get("row") or {})
         match = _ID_NUMBER_RE.match(doc_id)
         if not match:
             return None
@@ -1024,7 +1020,7 @@ def _scan_rows(
         if not rows:
             break
         for row in rows:
-            doc_id = str(row.get("_id") or "")
+            doc_id = _row_doc_id(row)
             if doc_id in wanted and doc_id not in found:
                 found[doc_id] = row
         offset += PAGE_SIZE
@@ -1079,7 +1075,7 @@ def fetch_rows_by_ids(
                 stats.pages += 1
                 rows = [item.get("row") or {} for item in (payload.get("rows") or []) if isinstance(item, dict)]
                 stats.rows_scanned += len(rows)
-                by_id = {str(row.get("_id") or ""): row for row in rows}
+                by_id = {_row_doc_id(row): row for row in rows}
                 for doc_id in pages[page_offset]:
                     row = by_id.get(doc_id)
                     if row is not None:
@@ -1139,7 +1135,7 @@ def sample_rows(
         rows = [item.get("row") or {} for item in (payload.get("rows") or []) if isinstance(item, dict)]
         stats.rows_scanned += len(rows)
         for row in rows:
-            doc_id = str(row.get("_id") or "")
+            doc_id = _row_doc_id(row)
             if not doc_id or doc_id in exclude:
                 continue
             exclude.add(doc_id)
@@ -1165,6 +1161,10 @@ def _stable_seed(*parts: Any) -> int:
 def fetch_qrels(client: DatasetClient, dataset: str, config: str, split: str) -> tuple[dict[str, dict[str, float]], int]:
     """拉完整 qrels → ``{query_id: {doc_id: score}}``（只保留 ``score > 0``）。
 
+    键名兼容两套写法：MTEB 官方（``mteb/CodeSearchNetRetrieval``）与 datasets-server
+    导出的 CoIR 数据都用连字符 ``query-id`` / ``corpus-id``，但下划线写法 ``query_id`` /
+    ``corpus_id`` 也一并兜住，避免换个数据源就整表读空。
+
     :return: ``(qrels, 读取的行数)``
     """
     num_rows = client.num_rows(dataset, config, split)
@@ -1173,8 +1173,8 @@ def fetch_qrels(client: DatasetClient, dataset: str, config: str, split: str) ->
     for page in iter_rows(client, dataset, config, split, num_rows):
         for row in page:
             read += 1
-            query_id = str(row.get("query-id") or "").strip()
-            doc_id = str(row.get("corpus-id") or "").strip()
+            query_id = str(row.get("query-id") or row.get("query_id") or "").strip()
+            doc_id = str(row.get("corpus-id") or row.get("corpus_id") or "").strip()
             if not query_id or not doc_id:
                 continue
             try:
@@ -1195,6 +1195,29 @@ def sample_query_ids(query_ids: Sequence[str], limit: int, seed: int, task_name:
     rng = random.Random(_stable_seed(seed, task_name, "queries"))
     picked = rng.sample(ordered, limit)
     return sorted(picked)
+
+
+def shard_query_ids(query_ids: Sequence[str], index: int, total: int) -> list[str]:
+    """把排序去重后的 query_id **连续均分**成 ``total`` 片，返回第 ``index`` 片（0-based）。
+
+    互斥且并集为全集：前 ``len(query_ids) % total`` 片各多 1 条（1,000 条 / 34 片 →
+    前 16 片 30 条、其余 18 片 29 条）。纯函数、不依赖网络与随机数，便于单测。
+
+    :raises ValueError: ``index`` 越界，或 ``total <= 0``。
+    """
+    ordered = sorted(set(str(item) for item in query_ids))
+    total = int(total)
+    if total <= 0:
+        raise ValueError(f"shard total 必须 >= 1，收到 {total}")
+    if total == 1:
+        return ordered
+    index = int(index)
+    if index < 0 or index >= total:
+        raise ValueError(f"shard index 必须在 0..{total - 1} 之间，收到 {index}")
+    base, extra = divmod(len(ordered), total)
+    start = index * base + min(index, extra)
+    stop = start + base + (1 if index < extra else 0)
+    return ordered[start:stop]
 
 
 # ---------------------------------------------------------------------------
@@ -1290,7 +1313,7 @@ def materialize_docs(
     docmap: "OrderedDict[str, str]" = OrderedDict()
     written = 0
     for row in rows:
-        doc_id = str(row.get("_id") or "")
+        doc_id = _row_doc_id(row)
         if not doc_id or doc_id in docmap.values():
             continue
         filename = safe_doc_filename(doc_id, spec.doc_ext)
@@ -1475,7 +1498,13 @@ def prepare_task(spec: TaskSpec, client: DatasetClient, options: PrepareOptions)
 
     # 每任务配额优先（注册表 self-describing），否则用全局 --limit-queries
     effective_limit = spec.query_quota if spec.query_quota is not None else options.limit_queries
-    query_ids = sample_query_ids(list(qrels_all), effective_limit, options.seed, spec.name)
+    candidates = sample_query_ids(list(qrels_all), effective_limit, options.seed, spec.name)
+    if spec.shard_index is not None and spec.shard_total is not None:
+        # 确定性分片：候选集（分片任务的 query_quota=0，故这里是该语言全部 query）排序后
+        # 连续均分成 shard_total 片，本任务只取第 shard_index 片 —— 100 片并集 = 全部 query。
+        query_ids = shard_query_ids(candidates, spec.shard_index, spec.shard_total)
+    else:
+        query_ids = candidates
     if not query_ids:
         raise DatasetError(f"{spec.name}: 抽样后没有可用 query")
 
@@ -1506,44 +1535,70 @@ def prepare_task(spec: TaskSpec, client: DatasetClient, options: PrepareOptions)
                 gold_ids_ordered.append(doc_id)
 
     truncated = False
-    if len(gold_ids_ordered) > options.corpus_size:
-        truncated = True
-        warnings.append(
-            f"gold doc 数 {len(gold_ids_ordered)} 超过 --corpus-size {options.corpus_size}，"
-            f"已截断到 {options.corpus_size}（部分 query 的 gold 会缺失，指标偏低）"
-        )
-        gold_ids_ordered = gold_ids_ordered[: options.corpus_size]
-        seen_gold = set(gold_ids_ordered)
-
-    need_distractors = max(0, options.corpus_size - len(gold_ids_ordered))
-    distractor_rows, distractor_stats = sample_rows(
-        client,
-        spec.hf_dataset,
-        layout.corpus_config,
-        layout.corpus_split,
-        corpus_rows_total,
-        need_distractors,
-        options.seed,
-        exclude=set(seen_gold),
-    )
-
-    gold_rows, gold_stats = fetch_rows_by_ids(
-        client, spec.hf_dataset, layout.corpus_config, layout.corpus_split, gold_ids_ordered, corpus_rows_total
-    )
-    if gold_stats.missing:
-        warnings.append(
-            f"{len(gold_stats.missing)} 个 gold doc 在 corpus 里找不到"
-            f"（例如 {gold_stats.missing[0]}），该 query 的 qrels 会被裁剪"
-        )
-
+    distractor_rows: list[dict[str, Any]] = []
+    distractor_stats = FetchStats(mode="skip")
     pool_rows: list[dict[str, Any]] = []
     seen_docs: set[str] = set()
-    for row in list(gold_rows.values()) + distractor_rows:
-        doc_id = str(row.get("_id") or "")
-        if not doc_id or doc_id in seen_docs:
-            continue
-        seen_docs.add(doc_id)
-        pool_rows.append(row)
+
+    if spec.full_corpus:
+        # **全量物化**：同 corpus_key 的所有分片必须看到逐字节一致的 docs/ 与 docmap.json，
+        # 否则共享索引里 A 分片的 gold 会指向 B 分片写的文件。因此这里按 corpus 的**原始顺序**
+        # 物化全部行：不截断 gold、不抽随机干扰文档（--corpus-size 对该任务不生效）。
+        gold_stats = FetchStats(mode="full")
+        for page in iter_rows(
+            client, spec.hf_dataset, layout.corpus_config, layout.corpus_split, corpus_rows_total
+        ):
+            gold_stats.pages += 1
+            gold_stats.rows_scanned += len(page)
+            for row in page:
+                doc_id = _row_doc_id(row)
+                if not doc_id or doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+                pool_rows.append(row)
+        missing_gold = [doc_id for doc_id in gold_ids_ordered if doc_id not in seen_docs]
+        if missing_gold:
+            warnings.append(
+                f"{len(missing_gold)} 个 gold doc 在 corpus 里找不到"
+                f"（例如 {missing_gold[0]}），该 query 的 qrels 会被裁剪"
+            )
+    else:
+        if len(gold_ids_ordered) > options.corpus_size:
+            truncated = True
+            warnings.append(
+                f"gold doc 数 {len(gold_ids_ordered)} 超过 --corpus-size {options.corpus_size}，"
+                f"已截断到 {options.corpus_size}（部分 query 的 gold 会缺失，指标偏低）"
+            )
+            gold_ids_ordered = gold_ids_ordered[: options.corpus_size]
+            seen_gold = set(gold_ids_ordered)
+
+        need_distractors = max(0, options.corpus_size - len(gold_ids_ordered))
+        distractor_rows, distractor_stats = sample_rows(
+            client,
+            spec.hf_dataset,
+            layout.corpus_config,
+            layout.corpus_split,
+            corpus_rows_total,
+            need_distractors,
+            options.seed,
+            exclude=set(seen_gold),
+        )
+
+        gold_rows, gold_stats = fetch_rows_by_ids(
+            client, spec.hf_dataset, layout.corpus_config, layout.corpus_split, gold_ids_ordered, corpus_rows_total
+        )
+        if gold_stats.missing:
+            warnings.append(
+                f"{len(gold_stats.missing)} 个 gold doc 在 corpus 里找不到"
+                f"（例如 {gold_stats.missing[0]}），该 query 的 qrels 会被裁剪"
+            )
+
+        for row in list(gold_rows.values()) + distractor_rows:
+            doc_id = _row_doc_id(row)
+            if not doc_id or doc_id in seen_docs:
+                continue
+            seen_docs.add(doc_id)
+            pool_rows.append(row)
 
     destination = corpus_dir(options.workdir, spec)
     docmap, written = materialize_docs(spec, pool_rows, destination, force=options.force)
@@ -1598,8 +1653,13 @@ def prepare_task(spec: TaskSpec, client: DatasetClient, options: PrepareOptions)
     }
 
     if not options.quiet:
+        shard_note = (
+            f" [shard {spec.shard_index + 1:02d}/{spec.shard_total}]"
+            if spec.shard_index is not None and spec.shard_total is not None
+            else ""
+        )
         _log(
-            f"[prepare] {spec.name}: qrels={layout.qrels_config}/{qrels_split} "
+            f"[prepare] {spec.name}{shard_note}: qrels={layout.qrels_config}/{qrels_split} "
             f"({len(qrels_all)} queries, {qrels_read} rows) → 抽 {len(tasks)} 题；"
             f"池 {len(pool_ids)} doc（gold {len(gold_ids_ordered)} + 干扰 {len(distractor_rows)}）；"
             f"corpus 扫描 {gold_stats.mode}/{gold_stats.pages}p + 抽样 {distractor_stats.pages}p"
@@ -1620,6 +1680,10 @@ def prepare_task(spec: TaskSpec, client: DatasetClient, options: PrepareOptions)
             "qrels_split": qrels_split,
             "doc_ext": spec.doc_ext,
             "language": spec.language,
+            # 共享语料 / 分片口径必须显式记录：同一 corpus_key 的所有分片共用一次 init
+            "corpus_key": spec.corpus_key,
+            "full_corpus": bool(spec.full_corpus),
+            "shard": {"index": spec.shard_index, "total": spec.shard_total},
             # 物化口径必须显式记录：diff_postimage 会改变写盘内容（语料可索引性的必要条件）
             "materialization": {
                 "doc_ext": spec.doc_ext,
@@ -1635,7 +1699,8 @@ def prepare_task(spec: TaskSpec, client: DatasetClient, options: PrepareOptions)
             "num_pool_docs": len(pool_ids),
             "num_gold_docs": len(gold_ids_ordered),
             "num_distractor_docs": len(distractor_rows),
-            "n_pool_docs_target": options.corpus_size,
+            # full_corpus 任务不看 --corpus-size：目标池大小就是实际物化的全量文档数
+            "n_pool_docs_target": len(pool_ids) if spec.full_corpus else options.corpus_size,
             "gold_truncated": truncated,
             "docs_written": written,
             "corpus_dir": str(destination),
