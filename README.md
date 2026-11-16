@@ -228,6 +228,32 @@ If embedding/Reranker are unavailable, the pipeline falls back gracefully to gra
 
 No daemon, no HTTP server. Every command is a standalone process.
 
+## Benchmarks
+
+End-to-end retrieval quality on public code-search benchmarks. Every number below is produced by
+the harnesses in [`evals/`](evals/) — measured, not estimated.
+
+| Benchmark | What it measures | Scale | Metric | Result |
+|-----------|------------------|-------|--------|:------:|
+| **[MTEB(Code, v1)](evals/mtebcode/)** | Natural language → function retrieval over real go / java / python source, plus CosQA | 101 tasks · 3,040 queries | nDCG@10 | **0.9182** |
+| **[RepoQA](evals/repoqa/)** | Repository-level localization inside a real codebase (needle in a haystack) | 10 repos · 5 languages · 100 tasks | accuracy | **84.0%** |
+
+**MTEB(Code)** — go `0.9448` · java `0.9101` · python `0.8994` · CosQA `0.9598`, with recall@10
+`0.9720` and MRR@10 `0.9004`: the right function is almost always retrieved, so what remains to win
+is rank-1 ordering rather than candidate generation.
+
+**RepoQA** — typescript `100%` · python `90%` · rust `90%` · java `85%` · cpp `55%`.
+
+```bash
+# Full reproduction commands: evals/*/results/README.md
+cd evals/mtebcode && python3 -m mtebcode_eval prepare --tasks csn,CosQA
+cd evals/repoqa   && python3 -m repoqa_eval prepare
+```
+
+> Conditions: codeseek v0.1.31 with `Qwen/Qwen3-Embedding-4B`, `index.hybrid.cutoff.enabled = false`.
+> Full reports under [`evals/mtebcode/results/`](evals/mtebcode/results/) and
+> [`evals/repoqa/results/`](evals/repoqa/results/).
+
 ## Supported Languages
 
 | Language | Functions | Structs/Classes | Call Graph |
